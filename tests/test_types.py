@@ -156,6 +156,13 @@ class TestDBAPITypeSemantics:
     def test_ne_returns_not_implemented_for_non_int(self) -> None:
         assert STRING.__ne__("hello") is NotImplemented
 
+    def test_eq_ne_reject_bool(self) -> None:
+        for flag in (True, False):
+            assert (STRING == flag) is False
+            assert (STRING != flag) is True
+        assert STRING.__eq__(True) is NotImplemented
+        assert STRING.__ne__(True) is NotImplemented
+
     def test_repr(self) -> None:
         assert repr(STRING) == "DBAPIType('STRING')"
         assert repr(NUMBER) == "DBAPIType('NUMBER')"
