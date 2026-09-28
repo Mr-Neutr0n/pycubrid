@@ -35,7 +35,8 @@ def test_prepare_exact_holdable_request() -> None:
     packet = protocol.PreparePacket(
         "SELECT ?", auto_commit=True, prepare_flag=CCIPrepareOption.HOLDABLE
     )
-    assert _arguments(packet.write(_CAS_INFO), 2) == [b"SELECT ?\x00", b"\x08", b"\x01"]
+    frame = packet.write(_CAS_INFO)
+    assert _arguments(frame, 2) == [b"SELECT ?\x00", b"\x08", b"\x01"]
 
 
 def test_execute_exact_scalar_argument_pairs() -> None:
@@ -87,7 +88,8 @@ def test_signed_int32_edges_are_exact(value: int) -> None:
         bindings=(protocol._encode_prepared_scalar(value),),
         bind_count=1,
     )
-    assert _arguments(packet.write(_CAS_INFO), 3)[10:] == [b"\x08", struct.pack(">i", value)]
+    frame = packet.write(_CAS_INFO)
+    assert _arguments(frame, 3)[10:] == [b"\x08", struct.pack(">i", value)]
 
 
 def test_bind_count_mismatch_rejects_before_frame_is_built() -> None:
@@ -164,9 +166,10 @@ def test_string_values_remain_separate_from_sql_template(value: str) -> None:
         bindings=(protocol._encode_prepared_scalar(value),),
         bind_count=1,
     )
-    args = _arguments(packet.write(_CAS_INFO), 3)
+    frame = packet.write(_CAS_INFO)
+    args = _arguments(frame, 3)
     assert args[10:] == [b"\x01", value.encode("utf-8") + b"\x00"]
-    assert b"SELECT ?" not in packet.write(_CAS_INFO)
+    assert b"SELECT ?" not in frame
 
 
 @given(
@@ -184,11 +187,12 @@ def test_generated_sql_and_value_are_distinct_wire_arguments(sql_tag: str, value
         bindings=(protocol._encode_prepared_scalar(secret),),
         bind_count=1,
     )
-    execute_args = _arguments(packet.write(_CAS_INFO), 3)
+    frame = packet.write(_CAS_INFO)
+    execute_args = _arguments(frame, 3)
     assert prepare_args[0] == sql.encode("utf-8") + b"\x00"
     assert b"VALUE:" not in prepare_args[0]
     assert execute_args[10:] == [b"\x01", secret.encode("utf-8") + b"\x00"]
-    assert sql.encode("utf-8") not in packet.write(_CAS_INFO)
+    assert sql.encode("utf-8") not in frame
 
 
 @given(

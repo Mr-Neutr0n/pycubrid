@@ -40,7 +40,7 @@ def test_internal_scalar_packets_repeat_on_one_handle(
     expected: Sequence[tuple[object, ...]],
 ) -> None:
     conn = pycubrid.connect(**connect_kwargs(), autocommit=autocommit)
-    try:
+    with conn:
         prep = PreparePacket(sql, auto_commit=autocommit, prepare_flag=CCIPrepareOption.HOLDABLE)
         conn._send_and_receive(prep)
         generation = conn._physical_generation
@@ -61,68 +61,62 @@ def test_internal_scalar_packets_repeat_on_one_handle(
                 assert conn._physical_generation == generation
         finally:
             conn._send_and_receive(CloseQueryPacket(prep.query_handle))
-    finally:
-        conn.close()
 
 
 def test_internal_dml_packets_repeat_without_implicit_manual_commit() -> None:
-    conn = pycubrid.connect(**connect_kwargs(), autocommit=False)
-    observer = pycubrid.connect(**connect_kwargs(), autocommit=True)
-    table = table_name("p475")
-    created = False
-    try:
-        setup = conn.cursor()
-        try:
-            setup.execute(f"CREATE TABLE {table} (id INTEGER)")
-            created = True
-        finally:
-            setup.close()
-        conn.commit()
-
-        def count_rows() -> int:
-            cursor = observer.cursor()
+    with pycubrid.connect(**connect_kwargs(), autocommit=False) as conn:
+        with pycubrid.connect(**connect_kwargs(), autocommit=True) as observer:
+            table = table_name("p475")
+            created = False
             try:
-                cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                row = cursor.fetchone()
-                assert row is not None
-                return int(row[0])
-            finally:
-                cursor.close()
-
-        prep = PreparePacket(
-            f"INSERT INTO {table} VALUES (?)",
-            auto_commit=False,
-            prepare_flag=CCIPrepareOption.HOLDABLE,
-        )
-        conn._send_and_receive(prep)
-        try:
-            for value in (11, 12):
-                packet = ExecutePacket(
-                    prep.query_handle,
-                    prep.statement_type,
-                    auto_commit=False,
-                    protocol_version=conn._protocol_version,
-                    bindings=(_encode_prepared_scalar(value),),
-                    bind_count=prep.bind_count,
-                )
-                conn._send_and_receive(packet)
-                assert packet.total_tuple_count == 1
-            assert count_rows() == 0
-        finally:
-            conn._send_and_receive(CloseQueryPacket(prep.query_handle))
-        assert count_rows() == 0
-        conn.commit()
-        assert count_rows() == 2
-    finally:
-        try:
-            if created:
-                conn.rollback()
-                cleanup = conn.cursor()
+                setup = conn.cursor()
                 try:
-                    cleanup.execute(f"DROP TABLE {table}")
+                    setup.execute(f"CREATE TABLE {table} (id INTEGER)")
+                    created = True
                 finally:
-                    cleanup.close()
+                    setup.close()
                 conn.commit()
-        finally:
-            observer.close()
-            conn.close()
+
+                def count_rows() -> int:
+                    cursor = observer.cursor()
+                    try:
+                        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                        row = cursor.fetchone()
+                        assert row is not None
+                        return int(row[0])
+                    finally:
+                        cursor.close()
+
+                prep = PreparePacket(
+                    f"INSERT INTO {table} VALUES (?)",
+                    auto_commit=False,
+                    prepare_flag=CCIPrepareOption.HOLDABLE,
+                )
+                conn._send_and_receive(prep)
+                try:
+                    for value in (11, 12):
+                        packet = ExecutePacket(
+                            prep.query_handle,
+                            prep.statement_type,
+                            auto_commit=False,
+                            protocol_version=conn._protocol_version,
+                            bindings=(_encode_prepared_scalar(value),),
+                            bind_count=prep.bind_count,
+                        )
+                        conn._send_and_receive(packet)
+                        assert packet.total_tuple_count == 1
+                    assert count_rows() == 0
+                finally:
+                    conn._send_and_receive(CloseQueryPacket(prep.query_handle))
+                assert count_rows() == 0
+                conn.commit()
+                assert count_rows() == 2
+            finally:
+                if created:
+                    conn.rollback()
+                    cleanup = conn.cursor()
+                    try:
+                        cleanup.execute(f"DROP TABLE {table}")
+                    finally:
+                        cleanup.close()
+                    conn.commit()
