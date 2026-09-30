@@ -45,6 +45,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`llms.txt` no longer advertises prepared statements, and the two entry points are single-sourced (#414)** — the root `llms.txt` claimed prepared statements and a `Cursor.prepare()` method, which ordinary cursors do not have, listed an incomplete exception hierarchy, hardcoded test and coverage counts and linked to the retired `cubrid-cookbook/python` paths, while `docs/llms.txt` was a separately maintained, differing index. `docs/llms.txt` is now the only maintained index, checked against the code: driver-side literal binding and its documented limits, the opt-in sync-only `pycubrid.compat.native` prepared subset, sync and async (`pycubrid.aio`) feature parity, the full PEP 249 exception list and `cubrid-cookbook-python` links. `scripts/generate_llms_full.py` copies it byte-for-byte to the root `llms.txt`, and the CI `lint` job now fails when either `docs/llms-full.txt` or `llms.txt` is stale. `docs/SUPPORT_MATRIX.md` and `docs/TROUBLESHOOTING.md` (+ Korean) no longer describe `cursor.execute(sql, params)` as server-side `PREPARE_AND_EXECUTE` binding (the section is renamed "Parameterized Query Issues"), and the support matrix notes that `nextset()` raises `NotSupportedError`; the Korean, German, Hindi, Russian and Chinese READMEs now describe driver-side binding like the English README. `CONTRIBUTING.md` documents the workflow.
 
 ### Fixed
+- `DBAPIType` comparison no longer reads `bool` values as integer type codes:
+  `STRING == True` and `STRING != False` are now `False` and `True`. Integer
+  subclasses such as `enum.IntEnum` still compare equal by value, so
+  `STRING == CUBRIDDataType.STRING` is unchanged. (#369)
 - **Row cells whose value does not use exactly their declared size are rejected (#523)** —
   the readers for fixed-width values (`SHORT`, `INT`, `BIGINT`, `FLOAT`,
   `DOUBLE`, `MONETARY`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `OBJECT`, and
@@ -404,10 +408,6 @@ unchanged):
 - Clarify contributor and maintainer review/label/translation responsibilities, validate populated standalone docs exceptions with executable event-JSON checks, and pin the two verified shared workflow callers. CI code/security/release gates and security support policy are unchanged.
 
 ### Fixed
-- `DBAPIType` comparison no longer reads `bool` values as integer type codes:
-  `STRING == True` and `STRING != False` are now `False` and `True`. Integer
-  subclasses such as `enum.IntEnum` still compare equal by value, so
-  `STRING == CUBRIDDataType.STRING` is unchanged. (#369)
 - Recover when the CAS closes the socket after a transaction boundary, and
   release open query handles at END_TRAN (#485). Since #468 the session survives
   commit/rollback, but the CAS may still close the socket right after an OUT_TRAN
