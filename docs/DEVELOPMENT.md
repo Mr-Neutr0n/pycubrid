@@ -11,6 +11,7 @@ Everything you need to set up, test, and contribute to pycubrid.
 - [Project Structure](#project-structure)
 - [Running Tests](#running-tests)
   - [Offline Tests](#offline-tests)
+  - [Sync/Async Replay Parity](#syncasync-replay-parity)
   - [Integration Tests](#integration-tests)
   - [Code Coverage](#code-coverage)
 - [Docker Setup](#docker-setup)
@@ -134,6 +135,128 @@ pytest tests/ -v --ignore=tests/test_integration.py \
 # Or use the Makefile
 make test
 ```
+
+### Backslash-escape-mode pin
+
+`tests/conftest.py` autouse-pins `no_backslash_escapes` to its legacy default
+for every test, because most tests build a `Connection`/`AsyncConnection`
+over a scripted fake socket that cannot answer the live `CHAR_LENGTH` escape
+probe. A module that needs the *real* probe (against a live server, or a
+scripted fake broker that answers it) opts out with `pytest.mark.no_escape_pin`,
+registered alongside the module's other markers, e.g.:
+
+```python
+pytestmark = [pytest.mark.integration, pytest.mark.no_escape_pin]
+```
+
+Opt-out used to be a hardcoded list of filename substrings, which silently
+matched unrelated modules (#524, e.g. `"test_integration"` matched every
+`test_integration_*.py` file). Mark the module explicitly instead of adding a
+new filename fragment.
+
+### Fast Driver Tests vs. Repository Tooling Checks
+
+Among the offline tests, a `repo_tooling`-marked subset (registered in
+`pyproject.toml`) checks repository policy and tooling — the docs-sync script,
+the PR-title validator, the release scripts, workflow-YAML contracts, the
+shared quality gate, and similar (#558). These carry no pycubrid driver
+behavior and are excluded from `pycubrid`'s own coverage, so they run in the
+dedicated `repo-tooling-tests` CI job instead of the `offline-tests` matrix,
+keeping routine driver feedback fast. Moving the check does not change
+whether CI requires it: `repo-tooling-tests` is still a required job in the
+CI Gate, just like `offline-tests`.
+
+```bash
+# Fast driver lane — mocked driver behavior only (what offline-tests runs)
+pytest tests/ -m "not integration and not repo_tooling" -v
+
+# Repository tooling lane — policy/tooling checks (what repo-tooling-tests runs)
+pytest tests/ -m "repo_tooling" -v
+
+# Both lanes together, still offline (no live CUBRID server)
+pytest tests/ -m "not integration" -v
+```
+
+A module opts into the tooling lane with an explicit `pytestmark = pytest.mark.repo_tooling`,
+not a file move or a path-based collection rule, so nothing needs reorganizing
+on disk and nothing is silently dropped from `pytest tests/` (every marker is
+additive to the default collection; only `-m` selects or excludes it at run
+time). `docs-sync.yml` runs `test_docs_reason.py` with a bare
+`python -m unittest discover` and no dependency install, so that module (and
+`test_pr_title.py`, at risk of the same thing) imports `pytest` in a
+`try`/`except ModuleNotFoundError` and falls back to an empty `pytestmark`
+when it is missing — the marker would be meaningless there anyway. A module
+only ever run through pytest does not need this guard.
+
+### Sync/Async Replay Parity
+
+`tests/test_replay_parity.py` checks, offline and in a few seconds, that the
+sync `Connection` and the async `AsyncConnection` behave the same against the
+same broker. `tests/helpers/replay_broker.py` is a threaded in-process CAS
+broker: it accepts any number of TCP sessions (so reconnects are real), answers
+each request through a per-scenario *script* with deterministic default replies
+built by `tests/helpers/cas_reply.py`, and records every request it receives.
+
+Each scenario is a list of public operations (`open`, `close`, `connect`,
+`execute`, `fetchall`, `commit`, `ping`, ...) plus a script. It is replayed
+through both drivers, each against a fresh broker, and four aspects are
+compared: step outcomes (return value or exception type), the exact requests
+sent (session, CAS function, echoed CAS_INFO, arguments), whether the connection
+is still usable afterwards (`ping(reconnect=False)`), and the number of TCP
+sessions. A scenario names the aspects in which the drivers are *meant* to
+differ, with a reason; every other difference fails. A known divergence that is
+not fixed yet is recorded with `unintended=` and runs as a strict `xfail`. Each
+scenario also carries a `check` run against both observations, so it cannot
+silently stop exercising its path.
+
+```bash
+pytest tests/test_replay_parity.py -v
+```
+
+Covered: connect/close, reconnect after close, autocommit set/restore (explicit,
+constructor, never set), handle invalidation by commit/rollback, the OUT_TRAN
+`CHECK_CAS` probe, one `CHECK_CAS` recovery (with autocommit restore and
+escape-mode re-probe) and a failed recovery, SQL bound to a replaced session
+(generation fence, #471/#485), failed `ping()` with and without recovery,
+malformed and truncated replies (#533), `DataError` keeping the session (#512)
+and the fetch-page `DataError` contract (#536). Task cancellation exists only
+in `pycubrid.aio` and is covered by `tests/test_async_cancellation.py` instead.
+
+To add a scenario, append a `Scenario` to `SCENARIOS` with its steps, a script
+built from `_on(...)` (for example `_hang_up_after_ok` to recycle the CAS after a
+reply) and a `check`.
+
+**Intended differences** (not failures):
+
+| Difference | Reason |
+|---|---|
+| `AsyncConnection(...)` does not connect; `await pycubrid.aio.connect(...)` does | `__init__` cannot await |
+| Async autocommit is set with `await conn.set_autocommit(v)` | a property setter cannot await |
+| Every async I/O method is a coroutine | asyncio API |
+| Async `create_lob()` raises `NotSupportedError` and sends no `LOB_NEW` | no async LOB support (scenario `create_lob`) |
+| Task cancellation | async only; excluded from parity |
+
+**Unintended differences found by the harness** (all fixed in #521):
+
+| Difference | Fix |
+|---|---|
+| Sync `connect()` after `close()` did not re-send an explicit `autocommit` (#520) | `connect()` restores explicit session state on every replacement session |
+| Sync `connect(autocommit=True)` used the reconnecting property setter: an extra `CHECK_CAS` between `SET_DB_PARAMETER` and `COMMIT`, a CAS recycled there split them across sessions, and a failure raised the native error with the socket left open | applied on the opened session only, with `OperationalError` on failure, like async |
+| Sync `ping(reconnect=False)` kept a session whose `CHECK_CAS` returned a negative code, and the next request reconnected silently | the broken session is closed, like async |
+| Async escape probe on a `CHECK_CAS` replacement session sent `auto_commit=0`; every other escape probe (both drivers) sends the connection's flag | the replacement probe sends the connection's flag |
+
+A shared gap (no parity difference) was fixed at the same time: with automatic
+escape detection, a CAS recycled right after the probe's `ROLLBACK` made
+`connect()` fail before autocommit was applied; both drivers now verify that
+OUT_TRAN session with `CHECK_CAS` first and replace it once.
+
+Another shared gap was fixed in #551 (scenario
+`autocommit_setter_survives_recycle_after_set_db_parameter`): the public
+autocommit setter sent `SET_DB_PARAMETER` and its `COMMIT` on different CAS
+sessions when the CAS was recycled between them. The new value is now recorded
+before the `COMMIT`, so that request's single reconnect restores it on the
+replacement session first; a failed `COMMIT` closes the connection and keeps the
+previous value.
 
 ### Mutation Testing
 
@@ -482,12 +605,36 @@ filename-glob inventory:
 | Normal | `integration and not slow and not tls` | Regular PR/push CI, full compatibility matrix, and nightly bug hunt |
 | Slow | `integration and slow and not tls` | Nightly/manual bug hunt: soak, chaos, and concurrency stress |
 | TLS | `integration and tls` | Dedicated TLS jobs in regular CI and the full workflow |
+| Official differential | `integration and official_differential` | Required `official-differential` job (Python 3.10, CUBRID 10.2 and 11.4) in regular CI and the full workflow |
 
 `python scripts/check_integration_lanes.py` collects the current marker inventory
 and checks that each lane has an executable workflow command. The JUnit audit
-(`--results FILE`) fails unknown skips or empty/all-skipped runs. Missing optional
-CUBRIDdb native-comparison dependencies and platforms without `/proc` have explicit
-skip categories; missing broker/TLS configuration is not an accepted CI skip.
+(`--results FILE`) fails unknown skips or empty/all-skipped runs. Outside its own
+lane the official-driver differential skips as `official-lane-only`, and platforms
+without `/proc` have an explicit skip category. Missing broker/TLS configuration
+is not an accepted CI skip. `--lane official` accepts no skip at all.
+
+The official-driver differential (#446) compares pycubrid with the official
+`CUBRIDdb`/`_cubrid` driver built from pinned source. To reproduce it locally
+(Linux x86_64, git, CMake 3.21 or newer, a C compiler and Python 3.10 headers),
+run:
+
+```bash
+python3.10 scripts/build_official_oracle.py --out .official-oracle
+PYTHONPATH=.official-oracle PYCUBRID_OFFICIAL_ORACLE_REQUIRED=1 \
+  PYCUBRID_OFFICIAL_ORACLE_MANIFEST=.official-oracle/oracle.json \
+  PYCUBRID_DIFFERENTIAL_EVIDENCE=official-evidence.jsonl \
+  CUBRID_TEST_URL=cubrid://dba@localhost:33000/testdb \
+  python3.10 -m pytest tests/ -m "integration and official_differential"
+python scripts/check_official_differential.py --evidence official-evidence.jsonl
+```
+
+A new or changed claim goes in `tests/fixtures/official_differential_claims.json`.
+Its case goes in `CASES` in `tests/test_official_differential.py`. Then run
+`python scripts/check_official_differential.py --write-docs`. A divergence is
+either fixed, or recorded as a `deviation` with a reason, an issue and both
+observed values. Never edit an expected value just to match current output. See
+[the compatibility guide](UPSTREAM_COMPATIBILITY.md#official-driver-differential-gate-446).
 The nightly bug hunt also retains separate offline protocol, fault-broker, and
 placeholder checks under the wider Hypothesis profile.
 

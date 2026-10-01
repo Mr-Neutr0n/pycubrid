@@ -40,6 +40,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   locale such as `"ko_KR.euckr"` is accepted. `get_schema_info()` checks its arguments before sending, so an
   unencodable table or column pattern no longer closes the connection. A new `integration-charset` CI job runs the live round trips
   against CUBRID 11.4 created with `CUBRID_LOCALE=ko_KR.euckr`.
+- **Official-driver differential gate (#446)** — official behavior that
+  pycubrid claims is now listed in `tests/fixtures/official_differential_claims.json`.
+  Each claim is a `match`, or a `deviation` with a reason, an issue and both
+  drivers' observations, and names its API inventory and upstream scenario ids.
+  The first 18 claims are the #344 stored-type fetches, a static scalar row and
+  its `description`, and the #439 prepared INT/string subset. They include
+  three classified deviations: MONETARY, description size/null_ok, and native
+  `bind_param(None)`. `tests/test_official_differential.py` (replacing
+  `tests/test_cubriddb_differential.py`) runs one live case per claim through
+  pycubrid and the official driver. `scripts/build_official_oracle.py` builds
+  that driver from verified cubrid-python `e75ec36` and CCI `7d1eb8f` pins
+  with CMake directly, without patching upstream, and records the extension
+  SHA-256. A new required `official-differential` CI job (Python 3.10, CUBRID
+  10.2 and 11.4, cached oracle, skipped only for docs-only changes) is part of
+  the CI Gate and of the nightly/release full matrix. In that job, a missing
+  driver, zero cases, any skip, a mismatch or an unclassified divergence fails.
+  Evidence is uploaded as the `official-differential-evidence` artifact.
+  `scripts/check_official_differential.py` validates the ledger offline and
+  the evidence in CI, and generates the claim counts in the compatibility
+  guides. `check_integration_lanes.py` gains an `official` lane, and
+  `--lane official` accepts no skip.
+- **Typed collection parameters for ordinary cursors (#567)** — new
+  `pycubrid.types.Set`, `Multiset` and `Sequence` (also exported from
+  `pycubrid`) wrap an immutable tuple of elements and bind through `execute()`
+  and `executemany()` on ordinary sync and async cursors as `SET{...}`,
+  `MULTISET{...}` and `SEQUENCE{...}` literals, so SQLAlchemy and other DB-API
+  callers can bind CUBRID collections (cubrid-lab/sqlalchemy-cubrid#484).
+  Every element goes through the hardened scalar renderer (#518, #528), so
+  element types are the scalar parameter types and overridden methods on an
+  element subclass never reach the SQL; nested collections raise
+  `ProgrammingError`, and the classes cannot be subclassed. Plain Python
+  `set`/`list`/`tuple` parameters stay rejected (the message now names the
+  typed classes). Fetching is unchanged: with `decode_collections=True`
+  collections still decode to `frozenset`/`list`. Round trips, including
+  MULTISET duplicates and SEQUENCE order, run live on CUBRID 10.2 and 11.4,
+  and a replay scenario pins sync/async parity. The official driver has no
+  equivalent ordinary-execute API (its wrapper binds plain lists through
+  native prepared `bind_set`), so no differential claim is made.
+  Construction happens entirely in `__new__`; re-invoking `__init__` on an
+  existing instance (`obj.__init__(...)`) is a no-op and cannot mutate it or
+  change its hash (#568 review). The instances are safe to `copy.copy()`
+  (returns the same object; sharing element references either way is already
+  what a shallow copy means), `copy.deepcopy()` (returns the same object when
+  every element is itself immutable, which `copy.deepcopy()` of the elements
+  tuple already detects; an independent copy, with its own independently
+  copied elements, when an element such as `bytearray` is mutable, so
+  mutating the copy cannot alias back into the original) and `pickle`
+  (`__reduce__` round-trips through the public constructor instead of
+  pickle's default slot restore, which would otherwise call `setattr()` on
+  the immutable instance and raise). `format_parameter()` raises
+  `ProgrammingError` instead of leaking `AttributeError` for an instance that
+  bypassed `__new__` (for example `object.__new__(Set)`). A `dict` argument
+  is rejected (`TypeError`) by all three classes — iterating it would use
+  only its keys and silently drop the values — and `Sequence` additionally
+  rejects a `set`/`frozenset` argument (`TypeError`), since its iteration
+  order is not guaranteed and would make `Sequence`'s element order
+  nondeterministic; `Set` and `Multiset` still accept a `set`/`frozenset`.
 
 ### Documentation
 - **`llms.txt` no longer advertises prepared statements, and the two entry points are single-sourced (#414)** — the root `llms.txt` claimed prepared statements and a `Cursor.prepare()` method, which ordinary cursors do not have, listed an incomplete exception hierarchy, hardcoded test and coverage counts and linked to the retired `cubrid-cookbook/python` paths, while `docs/llms.txt` was a separately maintained, differing index. `docs/llms.txt` is now the only maintained index, checked against the code: driver-side literal binding and its documented limits, the opt-in sync-only `pycubrid.compat.native` prepared subset, sync and async (`pycubrid.aio`) feature parity, the full PEP 249 exception list and `cubrid-cookbook-python` links. `scripts/generate_llms_full.py` copies it byte-for-byte to the root `llms.txt`, and the CI `lint` job now fails when either `docs/llms-full.txt` or `llms.txt` is stale. `docs/SUPPORT_MATRIX.md` and `docs/TROUBLESHOOTING.md` (+ Korean) no longer describe `cursor.execute(sql, params)` as server-side `PREPARE_AND_EXECUTE` binding (the section is renamed "Parameterized Query Issues"), and the support matrix notes that `nextset()` raises `NotSupportedError`; the Korean, German, Hindi, Russian and Chinese READMEs now describe driver-side binding like the English README. `CONTRIBUTING.md` documents the workflow.
@@ -49,6 +106,129 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `STRING == True` and `STRING != False` are now `False` and `True`. Integer
   subclasses such as `enum.IntEnum` still compare equal by value, so
   `STRING == CUBRIDDataType.STRING` is unchanged. (#369)
+- **Negative FC41 column metadata lengths and column counts are rejected
+  (#555)** — a `PREPARE_AND_EXECUTE` reply whose column name, real name, table
+  name or default length was negative decoded that field as an empty string,
+  and a negative column count decoded as a result with no columns, although
+  `PREPARE` (FC2) and refreshed `EXECUTE` (FC3) metadata already rejected both.
+  The shared column-metadata parser now checks every length and the column
+  count before reading, so such a reply raises `OperationalError('malformed
+  response from broker')` on the sync and async connections and closes the
+  connection, like other framing damage (#383, #533). A normal server does not
+  send such replies. Zero-length metadata, valid FC2/FC3/FC41 replies and the
+  session-keeping `DataError` for a complete reply (#492, #512) are unchanged.
+- **Async setup failure no longer leaks into waiting tasks (#554)** — while
+  `AsyncConnection.connect()` configured a new session, other tasks waiting on
+  the setup gate re-raised the setup owner's exception instance, so cancelling
+  the task running `connect()` also cancelled every waiting task and appended
+  their frames to one shared traceback. Each waiter now raises a fresh
+  exception: a pycubrid error keeps its class (or the nearest
+  `pycubrid.exceptions` class when a subclass has a different constructor),
+  `code`, `errno` and `sqlstate` (the original chained as `__cause__`), any
+  other error becomes `OperationalError` naming it by `repr()`, and a cancelled or interrupted setup becomes
+  `OperationalError("connection setup was cancelled or interrupted in another
+  task; retry operation")`. The setup owner still raises its own exception
+  (including `CancelledError`), a waiter's own cancellation is unchanged, and
+  the failed session is still discarded before the gate opens. This covers
+  `connect()`, including the reconnect of `ping(reconnect=True)`.
+- **Invalid JSON text in a complete reply raises `DataError` (#543)** — a
+  `JSON` column value that is not valid JSON, decoded with
+  `json_deserializer=json.loads`, raised `json.JSONDecodeError` — a
+  `ValueError` subclass — so the connection layer reported it as
+  `OperationalError('malformed response from broker')` and closed the
+  connection, although the reply had been read in full. Under the #492/#512
+  contract a complete reply holding a value the client cannot represent is a
+  data problem: `PacketReader._parse_json` now raises `DataError` (the
+  `JSONDecodeError` chained as `__cause__`), and the existing complete-reply
+  bounds check (#383) applies before it is re-raised, so an ordinary
+  connection and cursor stay usable, both on `execute()` (the cursor has no
+  result set, `description` is `None`, but still owns and releases its server
+  handle) and on a later fetch page (rows already collected are kept, #507); a
+  truncated reply around the same cell is still reported as `OperationalError`
+  and closes the connection. The explicit prepared API
+  (`pycubrid.compat.native`), which threads the same `json_deserializer`,
+  stays fail-closed as for invalid UTF-8 and zero dates: it raises
+  `OperationalError` and retires the session. A caller-supplied
+  `json_deserializer` is not wrapped: only the built-in `json.loads` path is
+  reclassified.
+- **The autocommit setter keeps `SET_DB_PARAMETER` and `COMMIT` on one CAS session (#551)** —
+  in both drivers, `conn.autocommit = v` / `await conn.set_autocommit(v)` sent
+  `COMMIT` with implicit reconnect after an OUT_TRAN `SET_DB_PARAMETER` reply,
+  so a CAS recycled between the two sent only the `COMMIT` to the replacement
+  session: `autocommit` reported the new value while that session had the
+  broker default (first change) or the previous value (later change). The new
+  value is now recorded before the `COMMIT`, so the `COMMIT`'s single
+  `CHECK_CAS` reconnect restores it on the replacement first. A call replaces
+  the session at most once: if `SET_DB_PARAMETER` itself needed a reconnect, the
+  `COMMIT` is not allowed another one. If the `COMMIT` fails (including a
+  native error), the connection is closed, the previous value is kept and
+  `OperationalError` is raised with the cause chained; a rejected
+  `SET_DB_PARAMETER` still raises its native error and keeps the session.
+  Found by the offline sync/async replay parity suite (#521), whose strict
+  `xfail` scenario now passes.
+- **Sync `Connection.connect()` after `close()` restores an explicit `autocommit` (#520)** —
+  reopening a closed sync connection did not re-send `SET_DB_PARAMETER`
+  (`AUTO_COMMIT`), so the new CAS session kept the broker default while
+  `conn.autocommit` still reported the value the caller had set; the async
+  driver already restored it. `connect()` now re-applies an explicitly set
+  `autocommit` whenever it opens a new physical session after an earlier one,
+  which also covers `ping(reconnect=True)` recovery and the reconnect after a
+  failed `CHECK_CAS` probe (each still restores exactly once). A connection
+  whose `autocommit` was never set explicitly sends nothing extra. Found by the
+  offline sync/async replay parity suite (#521).
+- **Sync `connect(autocommit=True)` applies autocommit on one CAS session, like async (#521)** —
+  the sync constructor applied `autocommit=True` through the public property
+  setter, which probes an OUT_TRAN reply with `CHECK_CAS` and may reconnect in
+  between: a CAS recycled right after `SET_DB_PARAMETER` made it send the
+  `COMMIT` on a new session that never received `AUTO_COMMIT=1`, while
+  `conn.autocommit` reported `True`. It now sends both requests on the session
+  it just opened with implicit reconnect disabled, as `pycubrid.aio` does; any
+  failure closes the connection and raises `OperationalError` (the native
+  error is its `__cause__`; previously the native `DatabaseError` escaped and
+  the socket stayed open). A healthy connect no longer sends the extra
+  `CHECK_CAS` between the two requests.
+- **`connect()` verifies an OUT_TRAN session before applying autocommit (#521)** —
+  with automatic `no_backslash_escapes` detection the escape probe ends with a
+  `ROLLBACK`, so a new session is OUT_TRAN when the constructor's
+  `autocommit=True` or the restore of an explicit `autocommit` is sent without
+  implicit reconnect. A CAS recycled right after that `ROLLBACK` made the async
+  `connect()` and the reconnect restore fail (the sync constructor survived it
+  only through the reconnecting property setter replaced above). Both drivers now send
+  `CHECK_CAS` first in that case and, if it fails, replace the session once and
+  apply the setting there; a healthy or verified session sends nothing extra.
+  A session replaced during the escape probe itself is configured once by
+  that recovery and not again by `connect()`, and an interrupted sync setup
+  retires the new session instead of leaving it half-configured.
+  The async escape probe of that replacement also now carries the connection's
+  autocommit flag, like every other escape probe in both drivers.
+- **Sync `ping(reconnect=False)` closes a session whose `CHECK_CAS` failed, like async (#521)** —
+  when `CHECK_CAS` returned a negative code (broken CAS-to-DB link), the sync
+  driver returned `False` but kept the session, and the next request probed it
+  again and silently reconnected; `pycubrid.aio` closes it. Both now close the
+  confirmed-broken session: `ping(reconnect=False)` still returns `False`
+  without reconnecting, and later calls raise `InterfaceError` until
+  `connect()` or `ping(reconnect=True)`. A healthy ping, a closed connection
+  and `ping(reconnect=True)` are unchanged.
+- Clear previous results in synchronous and asynchronous `execute()` calls
+  after closing the old query handle (#373). A subsequent binding or request
+  failure leaves `description=None`, `rowcount=-1`, `lastrowid=None` and no
+  fetchable rows or held fetch-page error. If closing the old handle fails,
+  `execute()` keeps the buffered result and its page error; connection invalidation
+  or reconnect handling may still retire the handle.
+- **`CALL` and `EVALUATE` results and `NULL`-typed columns decode their values (#542)** —
+  under CAS protocol 8 (CUBRID 10.2+) each such cell starts with the two-byte
+  type header `0x80 | collection bits | charset`, type, the layout of column
+  metadata, but the row parser read one byte, took `0x83` as an unknown type and
+  returned the rest of the cell as raw `bytes`. `CALL` of a stored function or
+  method, `callproc()` and `EVALUATE` now return the decoded value (for example
+  `42` instead of `b'\x08\x00\x00\x00*'`, `'OID:@897|1|0'` for
+  `CALL find_user('dba') ON CLASS db_user`, a `datetime` for `DATETIME`), sync
+  and async; collection values keep their collection kind. The single-byte
+  header of older brokers is still accepted. A header longer than its cell is a
+  malformed reply (`OperationalError('malformed response from broker')`, the
+  connection closes), and the re-walk before `DataError` (#523) reads the same
+  header. Verified live on CUBRID 10.2 and 11.4. Documented in
+  `docs/API_REFERENCE.md` and `docs/PROTOCOL.md` (+ Korean).
 - **Row cells whose value does not use exactly their declared size are rejected (#523)** —
   the readers for fixed-width values (`SHORT`, `INT`, `BIGINT`, `FLOAT`,
   `DOUBLE`, `MONETARY`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `OBJECT`, and
@@ -66,6 +246,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   FETCH tuple count, which read as an empty page and silently ended the result
   set early, is rejected the same way. Documented in `docs/PROTOCOL.md` and
   `docs/TROUBLESHOOTING.md` (+ Korean).
+- **Tests: offline sync/async replay parity (#521)** —
+  `tests/test_replay_parity.py` replays scripted broker replies through a real
+  sync `Connection` and a real `AsyncConnection`, each against its own
+  in-process multi-session broker (`tests/helpers/replay_broker.py`) over a real
+  socket, and compares step outcomes, the exact requests sent, whether the
+  connection stays usable and the number of sessions. Scenarios cover
+  connect/close, reconnect after close, autocommit set/restore, handle
+  invalidation at commit/rollback, the OUT_TRAN `CHECK_CAS` probe and one
+  recovery, SQL bound to a replaced session, failed pings, malformed and
+  truncated replies and the `DataError` contracts (#512, #536). Intended
+  differences are listed per scenario with a reason and documented, with the
+  four unintended ones it found (fixed above), in `docs/DEVELOPMENT.md`
+  (+ Korean). `prepare_and_execute_reply()` in `tests/helpers/cas_reply.py`
+  gains a `total` keyword for replies that leave rows to later FETCH pages.
 - **Tests: protocol fuzzing seeds realistic replies (#523)** — every
   `tests/test_protocol_fuzz.py` seed used to carry zero columns, so no fuzz
   case reached column metadata or row cells. Seeds built by
@@ -302,6 +496,91 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `scripts/check_quality_tools.py` was updated to match. This fixes Dependabot's
   routine `pip`-ecosystem Ruff/Mypy bumps, which previously left the pre-commit
   hook revision stale and failed the quality-tool consistency gate (#476).
+
+### Tests
+- **`tests/test_docs_reason.py` runs the docs-sync script in-process instead
+  of spawning a fresh `python -` subprocess per fixture case, and the fake
+  `git` shim is a shell script instead of a Python one (#429)** — the event
+  JSON regression test took ~8.7s of the offline suite's ~22s runtime; it now
+  runs in well under a second, exercising the exact script text extracted
+  from the workflow file against the same fake `git` subprocess, just without
+  the per-case interpreter startup cost.
+- **`scripts/check_docs_reason.py` reduces empty emphasis inside a caption
+  before deciding it is populated (#429)** — a reason whose only content is a
+  caption like `[**<!-- empty -->**](/issue)` rendered no visible
+  explanation, but the `**` emphasis delimiters around the (invisible)
+  comment were counted as real content and the reason was accepted. Of the
+  four cases Codex reported against the final head of #425 (`e94ee3d`), this
+  was the only one still reproducible on `main`; the other three (an
+  unmatched backtick pairing across a type-6 HTML block, bracket-bearing
+  HTML-only captions, and compound empty-caption markup) were already fixed
+  by later commits before #425 merged. All four now have a regression
+  fixture. This is the smaller "harden the existing structure" option the
+  issue offered as an alternative to rewriting the helper; see the issue for
+  the recorded decision. The helper is shared byte-for-byte with
+  sqlalchemy-cubrid and cubrid-cookbook-python (#429), so the same fix needs
+  the same follow-up PR in each.
+- **The backslash-escape-mode pin opts out on an explicit marker, not a
+  filename guess (#524)** — `tests/conftest.py`'s autouse fixture used to skip
+  the pin for any module whose path matched one of 17 hardcoded filename
+  substrings; `"test_integration"` is a prefix of every `test_integration_*.py`
+  module, so all of them opted out whether or not they actually negotiate
+  against a live server. Opt-out is now `pytest.mark.no_escape_pin`
+  (registered in `pyproject.toml`), carried directly by every module that
+  needs it — alongside the existing `integration` marker for the ones that
+  also gate on a live server. `tests/test_integration_lanes.py` (a workflow-YAML
+  regression test that never builds a `Connection`) no longer opts out; every
+  other previously-opted-out module keeps the same behavior. Auditing every
+  `integration`-marked module (not just the ones the old filename list
+  happened to catch) found eight more that open real connections without an
+  explicit `no_backslash_escapes` and were silently pinned instead of
+  negotiating: `test_parity_integration.py`, `test_stress_concurrency.py`,
+  `test_compat_prepared_integration.py`, `test_compat_factories_integration.py`,
+  `test_tls_matrix_integration.py`, `test_aio_ssl_integration.py`, and one
+  function each in `test_cas_session_persistence.py` and
+  `test_connection_failures.py`; these now carry the marker too (a real
+  behavior change, fixing a latent bug predating this PR). Two further
+  `integration`-marked modules, `test_schema_integration.py` and
+  `test_schema_matrix.py`, were checked and correctly excluded: every
+  connection they open passes `no_backslash_escapes=True` explicitly, so the
+  pin was always a no-op for them. A follow-up review pass widened the audit
+  beyond `integration`-marked modules to every test that opens a live
+  connection: `test_benchmarks.py` (`pytest.mark.benchmark`, gated on
+  `CUBRID_TEST_URL` rather than `integration`) also negotiates for real and
+  now carries the marker too. `test_fault_broker.py` and
+  `test_aio_tls_handshake_hang.py` were checked and correctly excluded: both
+  talk to an in-process fake local server, not the configured live CUBRID
+  endpoint, and either pass `no_backslash_escapes` explicitly or only
+  exercise failure paths that never reach negotiation.
+- **Repository policy/tooling checks run in a separate required CI job
+  instead of the default offline-tests matrix (#558)** — the offline suite
+  mixed mocked driver-behavior tests with subprocess-/importlib-heavy
+  repository policy checks (docs-sync, PR-title, release scripts,
+  workflow-YAML contracts, the shared quality gate, and similar), which
+  unnecessarily lengthened routine driver feedback: on this machine, the
+  default offline run dropped from 79.9s to 50.2s (2,671 tests), with the
+  305 moved tests taking 29.0-30.6s of either figure, run count unchanged
+  (2,976 passed both before and after). The fifteen modules in question
+  (`test_docs_reason.py`, `test_pr_title.py`, `test_quality_tools.py`,
+  `test_release_detect.py`, `test_readiness_workflows.py`,
+  `test_prepare_release.py`, `test_release_summary.py`,
+  `test_release_workflows.py`, `test_pypi_duplicate_guard.py`,
+  `test_upstream_scenario_ledger.py`, `test_check_public_api.py`,
+  `test_issue_metadata.py`, `test_collect_repro.py`,
+  `test_integration_lanes.py`, `test_check_official_differential.py`) now
+  carry an explicit `pytestmark = pytest.mark.repo_tooling` (the marker is
+  registered in `pyproject.toml`, the same explicit-marker convention used
+  elsewhere in the suite) instead of relying on file location; nothing moved
+  on disk, so recursive pytest discovery still collects them and no check
+  silently disappears. `offline-tests` now runs
+  `-m "not integration and not repo_tooling"`; a new `repo-tooling-tests` CI
+  job runs `-m "repo_tooling"` on a 2-OS (ubuntu, macos) x 1-Python matrix,
+  keeping shell-dependent checks covered on both platforms without repeating
+  all five Python versions. `repo-tooling-tests` is a required job in the CI
+  Gate, alongside `offline-tests`, `lint`, `typecheck`, `packaging-smoke-test`
+  and `compat-check` — no CI requirement is weakened or dropped.
+  `docs/DEVELOPMENT.md` (and its Korean translation) documents the fast-driver,
+  repository-tooling and combined offline commands.
 
 ## [1.8.0] - 2026-09-29
 

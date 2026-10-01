@@ -47,7 +47,7 @@ graph TD
 |---|---|
 | `__init__.py` | PEP 249 module globals (`apilevel`, `threadsafety`, `paramstyle`), `connect()`, re-exports |
 | `exceptions.py` | `Warning`, `Error`, `InterfaceError`, `DatabaseError` + 6 subclasses |
-| `types.py` | `DBAPIType` class, `STRING`/`BINARY`/`NUMBER`/`DATETIME`/`ROWID` type objects, constructors |
+| `types.py` | `DBAPIType` class, `STRING`/`BINARY`/`NUMBER`/`DATETIME`/`ROWID` type objects, constructors, typed `Set`/`Multiset`/`Sequence` parameters |
 | `constants.py` | `CASFunctionCode` (41 funcs), `CUBRIDDataType` (27+ types), `CUBRIDStatementType`, protocol/data-size constants |
 | `packet.py` | Low-level binary read/write with big-endian byte ordering |
 | `protocol.py` | High-level CAS packet classes for each function code (20 packet types) |
@@ -113,6 +113,11 @@ heterogeneous failover.
   nonzero means NOT NULL. Normalize it to `is_nullable` / DB-API `null_ok`.
 - Column metadata keeps first-byte collection flags (`0x60`) distinct from the
   scalar/element type; `0x80` marks a full second type byte, not a scalar-only column.
+- Cells of CALL/EVALUATE results and of NULL-typed columns carry their own type
+  header, counted in the cell size, in the same layout: two bytes
+  (`0x80 | collection bits | charset`, type) under protocol 7+, one byte from older
+  brokers (#542). The row parser and the bounds re-walk before `DataError` read it
+  with one helper; a header longer than its cell is malformed.
 - FC9 schema metadata is condensed: type, scale, precision and name only, without
   SELECT constraint fields. Schema packets are owned by their original connection:
   consume with fetch_schema_info or abandon with close_schema_info, never replay
@@ -390,8 +395,9 @@ Do not mark work complete until code, tests, and documentation are consistent.
 Issue titles, pull request titles and commit subjects follow
 [CONTRIBUTING.md - Pull request and commit titles](CONTRIBUTING.md#pull-request-and-commit-titles):
 `type(scope)!: description` with types `feat`, `fix`, `docs`, `test`, `perf`,
-`refactor`, `ci`, `build`, `chore`, `style`, `revert`; English, lowercase start,
-no trailing period, no issue numbers in pull request titles (use `Closes #N` /
+`refactor`, `ci`, `build`, `chore`, `style`, `revert`; English, lowercase start
+unless the first word is an API name, acronym, or proper noun; no trailing
+period, no issue numbers in pull request titles (use `Closes #N` /
 `Refs #N` in the body). Pull requests are squash-merged and the pull request
 title becomes the commit title. The `PR title` check enforces it.
 

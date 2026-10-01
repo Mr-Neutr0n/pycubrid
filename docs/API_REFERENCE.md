@@ -49,6 +49,7 @@ Complete API documentation for pycubrid — a pure Python DB-API 2.0 driver for 
   - [UnknownConnectionOptionWarning](#unknownconnectionoptionwarning)
 - [Type Objects](#type-objects)
 - [Type Constructors](#type-constructors)
+  - [Typed Collection Parameters](#typed-collection-parameters)
 
 ---
 
@@ -520,7 +521,9 @@ read-only escape-mode probe before accepting application SQL.
 - With `reconnect=True`, probes the existing socket first and attempts one
   reconnect if disconnected, if the check fails with a transport/protocol error,
   or if `CHECK_CAS` returns a negative code (broken CAS-to-DB link).
-  `reconnect=False` reports the negative response as `False` without reconnecting.
+  `reconnect=False` reports the negative response as `False` without reconnecting
+  and closes that broken session (later calls raise `InterfaceError`), as the
+  async driver does.
   Only explicitly set autocommit is restored after successful recovery.
   Interrupted SQL is not replayed; the caller must decide whether retry is safe.
   An automatically detected `no_backslash_escapes` mode is probed again on a
@@ -669,7 +672,7 @@ def autocommit(self) -> bool
 def autocommit(self, value: bool) -> None
 ```
 
-Get or set the auto-commit mode. When enabled, each statement is committed immediately. Setting this property sends a `SetDbParameterPacket` and `CommitPacket` to flush the transaction state on the server.
+Get or set the auto-commit mode. When enabled, each statement is committed immediately. Setting this property sends a `SetDbParameterPacket` and `CommitPacket` to flush the transaction state on the server. Both take effect on one CAS session: if the CAS is recycled between them, the new value is restored on the replacement session before the `COMMIT` is sent there (at most one reconnect per call). If the `COMMIT` fails, the connection is closed, the previous value is kept and `OperationalError` is raised with the cause chained (#551).
 
 ```python
 conn = pycubrid.connect(database="testdb")
@@ -774,6 +777,17 @@ Prepare and execute a SQL statement.
 
 **Returns:** The cursor itself (for chaining).
 
+After closing the previous query handle, `execute()` clears its result state
+before binding parameters or sending the new statement, discarding buffered rows
+and any held fetch-page error. If binding or the request fails, `description` is
+`None`, `rowcount` is `-1`, `lastrowid` is `None`, and fetch methods raise
+`InterfaceError("No result set available")`. A later successful `execute()` can
+reuse the cursor. If closing the previous handle fails, `execute()` keeps the
+buffered result and its page error; connection invalidation or reconnect handling
+may still retire the handle. An undecodable replacement reply may open a new query
+handle, which stays tracked for cleanup. This behaviour applies to both `Cursor`
+and `AsyncCursor`.
+
 **Raises:**
 - `InterfaceError` if the cursor is closed
 - `ProgrammingError` on SQL errors or parameter mismatch
@@ -805,6 +819,7 @@ cur.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["alice", 30])
 | `datetime.date`      | `DATE'YYYY-MM-DD'` |
 | `datetime.time`      | `TIME'HH:MM:SS'` |
 | `datetime.datetime`  | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` |
+| `Set` / `Multiset` / `Sequence` | `SET{...}` / `MULTISET{...}` / `SEQUENCE{...}` |
 
 ---
 
@@ -986,8 +1001,19 @@ Call a stored procedure. Constructs and executes a `CALL procname(?, ?, ...)` st
 
 **Returns:** The original `parameters` sequence (as per PEP 249).
 
+A stored function's return value is the one row of the result set: fetch it
+with `fetchone()`. The same holds for `execute("CALL ...")` (including method
+calls such as `CALL find_user('dba') ON CLASS db_user`) and `EVALUATE`. Each
+value carries its own type on the wire and is decoded like a column of that
+type (`INT` to `int`, `VARCHAR` to `str`, `DATETIME` to `datetime`, an object
+to its `"OID:@page|slot|volume"` string, SQL `NULL` to `None`); before #542
+these values came back as raw `bytes`. `description` reports the column type as
+`NULL` (`0`) because the broker announces no type for it.
+
 ```python
 cur.callproc("my_procedure", [1, "hello"])
+cur.callproc("my_function")
+(value,) = cur.fetchone()
 ```
 
 ---
@@ -1162,6 +1188,20 @@ Async counterpart to `Connection` for use with `asyncio`, with a similar surface
 Concurrent awaiters on the same `AsyncConnection` are serialized with a per-connection
 `asyncio.Lock`, so shared use is safe but requests still execute one at a time.
 
+While `await conn.connect()` opens a session and configures it (backslash-escape probe,
+autocommit) — including the reconnect done by `ping(reconnect=True)` and `connect()` after
+`close()` — other tasks' operations on the same connection wait for that setup. If setup
+fails, the session is discarded and each waiting task raises its own exception (#554): a
+pycubrid error is re-raised as a new instance of the same class (or of the nearest
+`pycubrid.exceptions` class when a subclass has a different constructor) with the same
+`code`, `errno` and `sqlstate` and the original as `__cause__`; any other error as
+`OperationalError` naming it (`connection setup failed in another task: TimeoutError()`);
+and a cancelled setup as `OperationalError` — cancelling the task that runs `connect()`
+cancels only that task. A waiting task that is itself cancelled still raises
+`asyncio.CancelledError`. The CHECK_CAS recovery inside a request (#485) runs under the
+connection lock instead; its failure is raised in the request that triggered it, and
+later requests find the connection closed (`InterfaceError`).
+
 `AsyncConnection.__init__` accepts a keyword-only `autocommit: bool = False` argument, applied
 automatically the first time `await conn.connect()` completes — the same effect as
 `await conn.set_autocommit(True)`, but usable when constructing `AsyncConnection` directly
@@ -1178,7 +1218,7 @@ async with await pycubrid.aio.connect(database="testdb") as conn:
 ### `set_autocommit(value)`
 
 `AsyncConnection.autocommit` is read-only; use `await conn.set_autocommit(True)` to change it.
-Like the sync setter, this sends both `SetDbParameterPacket` and `CommitPacket`.
+Like the sync setter, this sends both `SetDbParameterPacket` and `CommitPacket` on one CAS session, with the same recycle and failure behavior (#551).
 
 ### `ping(reconnect=True)`
 
@@ -1199,7 +1239,9 @@ without SQL. Recovery can execute the read-only escape-mode probe.
 - With `reconnect=True`, probes the existing socket first and attempts one
   reconnect if disconnected, after a transport/protocol failure, or when
   `CHECK_CAS` returns a negative code (broken CAS-to-DB link).
-  `reconnect=False` reports the negative response as `False` without reconnecting.
+  `reconnect=False` reports the negative response as `False` without reconnecting
+  and closes that broken session (later calls raise `InterfaceError`), as the
+  sync driver does.
   Only explicitly set autocommit is restored; arbitrary SQL is never replayed.
   Automatic `no_backslash_escapes` detection runs on each new physical session,
   not on healthy same-session checks; explicit `True`/`False` remains pinned.
@@ -1679,3 +1721,63 @@ t = pycubrid.Time(14, 30, 0)
 ts = pycubrid.Timestamp(2025, 1, 15, 14, 30, 0)
 b = pycubrid.Binary(b"\x00\x01\x02")
 ```
+
+### Typed Collection Parameters
+
+```python
+class Set(elements: Iterable[Any] = ())
+class Multiset(elements: Iterable[Any] = ())
+class Sequence(elements: Iterable[Any] = ())
+```
+
+Defined in `pycubrid.types` and exported from `pycubrid` (added in #567). Each
+wraps its elements in an immutable `tuple` and binds as one typed CUBRID
+collection literal through `execute()`/`executemany()` on ordinary sync and
+async cursors. Plain `set`/`list`/`tuple` parameters stay rejected.
+
+| Class | Literal | Server semantics |
+|---|---|---|
+| `Set` | `SET{...}` | duplicates removed, order not kept |
+| `Multiset` | `MULTISET{...}` | duplicates kept, order not kept |
+| `Sequence` | `SEQUENCE{...}` (same type as `LIST{...}`) | duplicates and order kept |
+
+| Member | Description |
+|---|---|
+| `.elements` | The stored `tuple` of elements |
+| `iter()`, `len()` | Iterate over / count the elements |
+| `==`, `hash()` | Equal only to the same class with equal elements (order-sensitive for all three) |
+
+- Elements take the scalar parameter types (`None`, `bool`, `int`, `float`,
+  `Decimal`, `str`, `bytes`, `bytearray`, `date`, `time`, `datetime`) and are
+  rendered by the same hardened renderer; anything else, including a nested
+  collection, raises `ProgrammingError`.
+- A single `str`/`bytes`/`bytearray` argument raises `TypeError`; subclassing
+  raises `TypeError`; setting an attribute raises `AttributeError`.
+- A `dict` argument raises `TypeError` for all three classes (its keys would
+  be used silently and its values dropped). `Sequence` additionally raises
+  `TypeError` for a `set`/`frozenset` argument, since its iteration order is
+  not guaranteed; `Set` and `Multiset` accept a `set`/`frozenset`.
+- The instances are safe to `copy.copy()` (always returns the same object),
+  `copy.deepcopy()` (the same object when every element is itself immutable;
+  an independent copy, with independently copied elements, when an element
+  such as `bytearray` is mutable) and `pickle` (round-trips to an equal
+  instance). Re-invoking `__init__` on an existing instance is a no-op and
+  cannot mutate it.
+- Fetched collections are not returned as these classes: with
+  `decode_collections=True` they stay `frozenset` (`SET`) and `list`
+  (`MULTISET`/`SEQUENCE`).
+- `Sequence` is also a name in `typing`/`collections.abc`; `from pycubrid
+  import *` shadows it (and `Set`) with these classes. Prefer an explicit
+  import, e.g. `from pycubrid.types import Sequence as CubridSequence`, when
+  both are needed in the same module.
+
+```python
+from pycubrid import Multiset, Sequence, Set
+
+cur.execute(
+    "INSERT INTO t (tags, words, steps) VALUES (?, ?, ?)",
+    (Set([1, 2, 3]), Multiset(["a", "a"]), Sequence([3, 1, 2])),
+)
+```
+
+See [Parameter Binding](PARAMETER_BINDING.md#typed-collection-parameters).

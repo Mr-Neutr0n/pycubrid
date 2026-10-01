@@ -574,10 +574,14 @@ def _parse_schema_column_metadata(reader: PacketReader, column_count: int) -> li
     return columns
 
 
-def _parse_column_metadata(
-    reader: PacketReader, column_count: int, *, strict_lengths: bool = False
-) -> list[ColumnMetaData]:
-    """Parse column metadata entries from the reader."""
+def _parse_column_metadata(reader: PacketReader, column_count: int) -> list[ColumnMetaData]:
+    """Parse FC2/FC3/FC41 column metadata entries from the reader.
+
+    The text decoder reads a non-positive length as empty, so each metadata
+    length is bounded here first: a negative one is framing damage (#555).
+    """
+    if column_count < 0:
+        raise ValueError("negative prepared column count")
     columns: list[ColumnMetaData] = []
     for _ in range(column_count):
         column_type = _parse_column_type(reader)
@@ -585,22 +589,22 @@ def _parse_column_metadata(
         precision = reader._parse_int()
 
         name_len = reader._parse_int()
-        if strict_lengths and (name_len < 0 or name_len > reader.bytes_remaining()):
+        if name_len < 0 or name_len > reader.bytes_remaining():
             raise ValueError("invalid prepared column name length")
         name = reader._parse_metadata_text(name_len)
         real_name_len = reader._parse_int()
-        if strict_lengths and (real_name_len < 0 or real_name_len > reader.bytes_remaining()):
+        if real_name_len < 0 or real_name_len > reader.bytes_remaining():
             raise ValueError("invalid prepared column real-name length")
         real_name = reader._parse_metadata_text(real_name_len)
         table_name_len = reader._parse_int()
-        if strict_lengths and (table_name_len < 0 or table_name_len > reader.bytes_remaining()):
+        if table_name_len < 0 or table_name_len > reader.bytes_remaining():
             raise ValueError("invalid prepared column table-name length")
         table_name = reader._parse_metadata_text(table_name_len)
 
         # CAS sends is_non_null: zero means the column accepts NULL.
         is_nullable = reader._parse_byte() == 0
         default_len = reader._parse_int()
-        if strict_lengths and (default_len < 0 or default_len > reader.bytes_remaining()):
+        if default_len < 0 or default_len > reader.bytes_remaining():
             raise ValueError("invalid prepared column default length")
         default_value = reader._parse_metadata_text(default_len)
         is_auto_increment = reader._parse_byte() == 1
@@ -649,7 +653,7 @@ def _parse_prepare_info(reader: PacketReader) -> tuple[int, int, list[ColumnMeta
     return (
         statement_type,
         bind_count,
-        _parse_column_metadata(reader, column_count, strict_lengths=True),
+        _parse_column_metadata(reader, column_count),
     )
 
 
@@ -753,6 +757,23 @@ def _check_cell_size(column_type: int, size: int) -> None:
         raise _cell_size_mismatch(column_type, size)
 
 
+def _parse_cell_type(reader: PacketReader, size: int) -> tuple[int, int]:
+    """Read the type header of a CALL / NULL-typed row cell; return (type, value size).
+
+    Protocol 7+ brokers write the header as column metadata does (#542):
+    ``0x80 | collection bits | charset``, then the type byte. Older brokers write
+    one type byte. The header counts in the cell size, so a header longer than
+    the size is a malformed reply.
+    """
+    start = reader._offset
+    column_type = _parse_column_type(reader)
+    header_size = reader._offset - start
+    if header_size > size:
+        reader._offset = start
+        raise ValueError(f"row cell size {size} is shorter than its {header_size}-byte type")
+    return column_type, size - header_size
+
+
 def _check_row_data_bounds(
     reader: PacketReader,
     rows_start: int,
@@ -765,7 +786,7 @@ def _check_row_data_bounds(
     A size past the end of the reply raises ``ValueError`` from ``_skip_bytes``
     (#383), and a fixed-width value whose size disagrees with its width raises
     too (#523). ``typed`` marks CALL/NULL-typed columns, whose cells start with
-    their own type byte, counted in the size.
+    their own one- or two-byte type header, counted in the size (#542).
     """
     reader._offset = rows_start
     for _ in range(tuple_count):
@@ -776,9 +797,8 @@ def _check_row_data_bounds(
             if size <= 0:
                 continue
             if is_typed:
-                column_type = reader._parse_byte()
-                size -= 1
-                if size <= 0:
+                column_type, size = _parse_cell_type(reader, size)
+                if size == 0:
                     continue
             _check_cell_size(column_type, size)
             reader._skip_bytes(size)
@@ -801,7 +821,6 @@ def _parse_row_data(
 
     _parse_int = reader._parse_int
     _parse_bytes = reader._parse_bytes
-    _parse_byte = reader._parse_byte
     _skip_bytes = reader._skip_bytes
     _null_type = CUBRIDDataType.NULL
     _oid_size = DataSize.OID
@@ -843,9 +862,8 @@ def _parse_row_data(
                         continue
                     ct = col_types[i]
                     if is_call_type or ct == _null_type:
-                        ct = _parse_byte()
-                        size -= 1
-                        if size <= 0:
+                        ct, size = _parse_cell_type(reader, size)
+                        if size == 0:
                             continue
                     _check_cell_size(ct, size)
                     method_name = _get(ct)

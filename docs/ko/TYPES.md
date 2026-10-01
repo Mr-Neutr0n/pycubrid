@@ -24,6 +24,7 @@ pycubrid의 PEP 249 타입 객체·생성자·CUBRID CCI 데이터 타입 코드
 - [컬렉션 타입](#컬렉션-타입)
   - [JSON 컬럼](#json-컬럼)
   - [`decode_collections`](#decode_collections)
+  - [컬렉션 바인딩](#컬렉션-바인딩)
 - [사용 예제](#사용-예제)
 
 ---
@@ -442,6 +443,30 @@ JSON 컬럼은 CUBRID 타입 코드 `34`를 사용합니다.
 |---|---|
 | `False` (기본) | 컬렉션 페이로드를 raw CAS 와이어 `bytes`로 반환 |
 | `True` | 지원되는 `SET`, `MULTISET`, `SEQUENCE` 페이로드를 Python 컨테이너로 디코딩 |
+
+### 컬렉션 바인딩
+
+일반 Python `set`, `frozenset`, `list`, `tuple` 값은 파라미터로 거부됩니다. 컬렉션을 바인딩하려면 원소를 타입 지정 컬렉션 파라미터로 감싸세요(#567):
+
+| 클래스 | 렌더링되는 리터럴 | 서버 의미 |
+|---|---|---|
+| `pycubrid.types.Set` | `SET{...}` | 중복 제거, 순서 유지 안 함 |
+| `pycubrid.types.Multiset` | `MULTISET{...}` | 중복 유지, 순서 유지 안 함 |
+| `pycubrid.types.Sequence` | `SEQUENCE{...}` (`LIST{...}`와 같은 타입) | 중복과 순서 유지 |
+
+```python
+from pycubrid.types import Multiset, Sequence, Set
+
+cur.execute("INSERT INTO t VALUES (?, ?, ?)", (Set([1, 2]), Multiset(["a", "a"]), Sequence([3, 1])))
+```
+
+이 클래스들은 최상위 `pycubrid` 패키지에서도 export됩니다. 각각 불변이고, 원소를 `tuple`(`.elements`)로 저장하며, 하위 클래스를 만들 수 없습니다. 원소는 스칼라 파라미터와 같은 타입(`None`, `bool`, `int`, `float`, `Decimal`, `str`, `bytes`, `bytearray`, `date`, `time`, `datetime`)을 받으며 같은 보호된 렌더러로 렌더링됩니다. 중첩 컬렉션은 `ProgrammingError`를 발생시킵니다. 동기와 비동기 일반 커서 모두 지원합니다. [파라미터 바인딩](PARAMETER_BINDING.md#타입-지정-컬렉션-파라미터)을 참고하세요.
+
+세 클래스 모두 `dict`를 거부합니다(`TypeError`) — `dict`를 순회하면 키만 쓰이고 값은 조용히 버려지기 때문입니다. `Sequence`는 추가로 `set`/`frozenset`을 거부합니다(`TypeError`): 순회 순서가 보장되지 않아 순서가 있는 컬렉션의 원소 순서가 실행마다 달라질 수 있기 때문입니다. `Set`과 `Multiset`은 서버 측 의미가 이미 순서를 버리므로 `set`/`frozenset`을 그대로 받습니다. 이 인스턴스들은 `copy.copy()`(항상 같은 객체를 반환), `copy.deepcopy()`(모든 원소가 그 자체로 불변이면 같은 객체를 반환하고, `bytearray`처럼 가변인 원소가 있으면 원소까지 독립적으로 복사한 별개의 객체를 반환해 복사본을 변경해도 원본에 되돌아가 영향을 주지 않음), `pickle`(동등한 인스턴스로 왕복)에 안전하며, 기존 인스턴스에서 `__init__`을 다시 호출해도 변경할 수 없습니다.
+
+`Set`, `Multiset`, `Sequence`는 `pycubrid.types`와 `pycubrid`의 평범한 이름일 뿐 `typing`의 별칭이 아니지만, 그중 `Sequence`는 표준 `typing`/`collections.abc` 모듈에도 있는 이름입니다. `from pycubrid import *`를 쓰면 pycubrid의 `Set`과 `Sequence`가 스코프에 들어와 같은 방식으로 import한 `typing.Set`/`typing.Sequence`(또는 `collections.abc.Sequence`)를 가립니다. 같은 모듈에서 둘 다 필요하다면 `from pycubrid.types import Sequence as CubridSequence`처럼 명시적으로 import하거나(또는 `pycubrid`를 import해서 `pycubrid.Sequence`로 사용) 하세요.
+
+디코딩은 바뀌지 않습니다: 조회한 컬렉션은 위 표와 같이(`decode_collections=True`일 때) 일반 Python 컨테이너이며, 이 파라미터 타입이 아닙니다.
 
 ---
 

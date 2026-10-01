@@ -626,7 +626,10 @@ of a FETCH or inline execute reply must use exactly the bytes its size word
 declares: fixed-width values (`INT`, `DATE`, `OBJECT`, ...) do not read the size
 themselves, so the row parser checks it against the type's width before reading
 the value (#523), also when it re-walks a reply before raising `DataError`; a
-non-positive size is SQL `NULL`. A negative FETCH tuple count is malformed too. The
+non-positive size is SQL `NULL`. A negative FETCH tuple count is malformed too, and
+so is a negative column count or column name, real-name, table-name or default
+length in FC2, FC3 or FC41 column metadata (#555); a zero length is an empty
+string. The
 connection turns these exceptions into `OperationalError("malformed response
 from broker")` and closes; `DataError` stays reserved for a complete reply
 whose value Python cannot represent (#492, #512). Unread bytes after the last
@@ -658,6 +661,15 @@ Column metadata preserves the first type byte's `0x60` collection-kind bits:
 byte carries the full scalar/element type (including codes above 31); otherwise
 the low five bits carry it. Collection row dispatch uses the collection kind,
 not that element type.
+
+Cells of a `CALL` / `EVALUATE` result and of a column whose metadata type is
+`NULL` (`SELECT NULL`, ...) carry their own type header before the value, and
+the cell size counts it. Protocol 7+ brokers (CUBRID 10.2+) write it like
+column metadata: `0x80 | collection bits | charset`, then the type byte, for
+example `00000006 83 08 0000002a` for `CALL` of a function returning `INT` 42
+and `0000000a 83 13 <8-byte OID>` for `CALL find_user('dba') ON CLASS db_user`.
+Older brokers write one type byte. The driver reads either layout (#542); a
+header longer than its cell is a malformed reply.
 
 A collection value is one element-type byte, a 4-byte element count, then a
 4-byte length and payload per element; a NULL element has length `-1` and no

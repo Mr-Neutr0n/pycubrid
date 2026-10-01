@@ -50,6 +50,11 @@ class Wire:
     counts: list[int] = field(default_factory=list)  # int32 count words
     element_types: list[int] = field(default_factory=list)  # collection element-type bytes
     boundaries: list[int] = field(default_factory=list)  # field / cell / row starts
+    # Column-metadata text length words (name, real name, table, default) and
+    # column-count words of execute/prepare replies: negative values there are
+    # malformed framing, never an empty string or an empty column list (#555).
+    metadata_lengths: list[int] = field(default_factory=list)
+    column_counts: list[int] = field(default_factory=list)
 
     def mark(self) -> None:
         self.boundaries.append(len(self.buf))
@@ -77,6 +82,14 @@ class Wire:
         self.counts.append(len(self.buf))
         self.i32(value)
 
+    def column_count(self, value: int) -> None:
+        self.column_counts.append(len(self.buf))
+        self.count(value)
+
+    def metadata_text(self, value: str) -> None:
+        self.metadata_lengths.append(len(self.buf))
+        self.text(value)
+
     def element_type(self, value: int) -> None:
         self.element_types.append(len(self.buf))
         self.byte(value)
@@ -95,6 +108,8 @@ class Wire:
         self.counts += [base + offset for offset in other.counts]
         self.element_types += [base + offset for offset in other.element_types]
         self.boundaries += [base + offset for offset in other.boundaries]
+        self.metadata_lengths += [base + offset for offset in other.metadata_lengths]
+        self.column_counts += [base + offset for offset in other.column_counts]
 
     def seed(self, name: str) -> Seed:
         return Seed(
@@ -104,6 +119,8 @@ class Wire:
             counts=tuple(self.counts),
             element_types=tuple(self.element_types),
             boundaries=tuple(sorted(set(self.boundaries))),
+            metadata_lengths=tuple(self.metadata_lengths),
+            column_counts=tuple(self.column_counts),
         )
 
 
@@ -117,6 +134,8 @@ class Seed:
     counts: tuple[int, ...] = ()
     element_types: tuple[int, ...] = ()
     boundaries: tuple[int, ...] = ()
+    metadata_lengths: tuple[int, ...] = ()
+    column_counts: tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +157,24 @@ class Value:
     write: Callable[[Wire], None]
     expected: Any
     decoded_json: Any = None
+    element_type: int = 0  # element type of a collection value
+
+    def write_cell_type(self, w: Wire, *, legacy: bool = False) -> None:
+        """The type header of a CALL / NULL-typed cell (#542).
+
+        Protocol 7+ brokers send ``0x80 | collection bits | charset`` then the
+        scalar or element type, as ``net_buf_cp_cas_type_and_charset`` writes it
+        (charset 3 as CUBRID 10.2/11.4 send it). ``legacy`` is the single byte of
+        older brokers: collection bits plus a type below ``0x20``.
+        """
+        kind = _COLLECTION_KIND_BITS.get(self.column_type, 0)
+        scalar = self.element_type if kind else self.column_type
+        if legacy:
+            assert scalar < 0x20, "legacy type byte collides with collection bits"
+            w.byte(kind | scalar)
+        else:
+            w.byte(0x80 | kind | 0x03)
+            w.byte(scalar)
 
     def payload(self) -> Wire:
         sub = Wire()
@@ -285,7 +322,7 @@ def collection(kind: int, element_type: int, elements: Sequence[Value | None]) -
 
     decoded = [None if e is None else e.expected for e in elements]
     expected: Any = frozenset(decoded) if kind == T.SET else decoded
-    return Value(kind, write, expected)
+    return Value(kind, write, expected, element_type=element_type)
 
 
 def null_collection(kind: int, count: int) -> Value:
@@ -350,11 +387,11 @@ def write_column_metadata(w: Wire, columns: Sequence[Column]) -> None:
         col.write_type(w)
         w.i16(col.scale)
         w.i32(col.precision)
-        w.text(col.name)
-        w.text(col.name)  # real name
-        w.text(col.table)
+        w.metadata_text(col.name)
+        w.metadata_text(col.name)  # real name
+        w.metadata_text(col.table)
         w.byte(0 if col.nullable else 1)  # is_non_null
-        w.text(col.default)
+        w.metadata_text(col.default)
         pk = 1 if col.primary_key else 0
         for flag in (0, pk, pk, 0, 0, 0, 0):  # auto_inc, unique, pk, rev idx/uniq, fk, shared
             w.byte(flag)
@@ -372,11 +409,14 @@ def write_schema_columns(w: Wire, columns: Sequence[Column]) -> None:
 Row = Sequence[Value | None]
 
 
-def write_rows(w: Wire, rows: Sequence[Row], typed: Sequence[bool]) -> None:
+def write_rows(
+    w: Wire, rows: Sequence[Row], typed: Sequence[bool], *, legacy_cell_type: bool = False
+) -> None:
     """Rows: index, OID, then one sized cell per column (``-1`` is SQL NULL).
 
     ``typed[i]`` selects the CALL / NULL-typed-column layout for column ``i``:
-    the cell starts with its own type byte and its size includes that byte.
+    the cell starts with its own type header (two bytes, or one with
+    ``legacy_cell_type``) and its size includes that header.
     """
     for index, row in enumerate(rows, start=1):
         w.mark()
@@ -389,8 +429,10 @@ def write_rows(w: Wire, rows: Sequence[Row], typed: Sequence[bool]) -> None:
                 continue
             payload = cell.payload()
             if typed_cell:
-                w.length(len(payload.buf) + 1)
-                w.byte(cell.column_type)
+                header = Wire()
+                cell.write_cell_type(header, legacy=legacy_cell_type)
+                w.length(len(header.buf) + len(payload.buf))
+                w.raw(bytes(header.buf))
             else:
                 w.length(len(payload.buf))
             w.embed(payload)
@@ -422,6 +464,7 @@ class ResultSet:
     columns: tuple[Column, ...]
     rows: tuple[tuple[Value | None, ...], ...]
     statement_type: int = CUBRIDStatementType.SELECT
+    legacy_cell_type: bool = False  # one-byte CALL / NULL-typed cell headers
 
     def typed(self) -> list[bool]:
         """Which columns carry a per-cell type byte (CALL results, NULL-typed columns)."""
@@ -587,21 +630,39 @@ LOBS_AND_JSON = ResultSet(
     ),
 )
 
-# A CALL result: every cell carries its own type byte, sized with it. This is
-# the single-byte layout the driver decodes; protocol 8 brokers send a two-byte
-# header that it does not decode yet (#542).
+# A CALL result: every cell carries its own type header, sized with it. Protocol
+# 8 brokers send two bytes, ``0x80 | collection bits | charset`` then the type
+# (#542), the layout CUBRID 10.2 and 11.4 were captured sending.
 CALL_RESULT = ResultSet(
     "call",
     (Column("ret", T.NULL),),
-    ((int_(42),), (text("out"),), (None,), (numeric("3.25"),)),
+    (
+        (int_(42),),
+        (text("out"),),
+        (None,),
+        (numeric("3.25"),),
+        (datetime_(2026, 9, 30, 12, 34, 56, 789),),
+        (oid(897, 1, 0),),
+        (collection(T.SET, T.INT, [int_(1), int_(2)]),),
+        (collection(T.SEQUENCE, T.STRING, [text("a"), None]),),
+    ),
     statement_type=CUBRIDStatementType.CALL,
 )
 
-# ``SELECT NULL, x``: a NULL-typed column switches the whole row to typed cells.
+# The single-byte cell header of brokers before protocol 7, still accepted.
+CALL_RESULT_LEGACY = ResultSet(
+    "call_legacy",
+    CALL_RESULT.columns,
+    ((int_(42),), (text("out"),), (None,), (collection(T.SET, T.INT, [int_(3)]),)),
+    statement_type=CUBRIDStatementType.CALL,
+    legacy_cell_type=True,
+)
+
+# ``SELECT NULL, x``: only the NULL-typed column carries per-cell type headers.
 NULL_TYPED = ResultSet(
     "null_typed",
     (Column("n", T.NULL), Column("x", T.INT)),
-    ((None, int_(7)), (text("late"), int_(8))),
+    ((None, int_(7)), (text("late"), int_(8)), (datetime_(2026, 1, 2, 3, 4, 5, 6), None)),
 )
 
 WIDE = ResultSet(
@@ -628,6 +689,7 @@ RESULT_SETS: tuple[ResultSet, ...] = (
     COLLECTIONS,
     LOBS_AND_JSON,
     CALL_RESULT,
+    CALL_RESULT_LEGACY,
     NULL_TYPED,
     WIDE,
 )
@@ -645,7 +707,7 @@ def fetch_reply(rs: ResultSet) -> Seed:
     w.mark()
     w.i32(0)  # response code
     w.count(len(rs.rows))
-    write_rows(w, rs.rows, rs.typed())
+    write_rows(w, rs.rows, rs.typed(), legacy_cell_type=rs.legacy_cell_type)
     return w.seed(f"fetch/{rs.name}")
 
 
@@ -658,8 +720,15 @@ def _result_info(w: Wire, statement_type: int, count: int) -> None:
     w.i32(0)  # cache microseconds
 
 
-def prepare_and_execute_reply(rs: ResultSet, *, query_handle: int = 7) -> Seed:
-    """FC41 PREPARE_AND_EXECUTE with column metadata and the first page inline."""
+def prepare_and_execute_reply(
+    rs: ResultSet, *, query_handle: int = 7, total: int | None = None
+) -> Seed:
+    """FC41 PREPARE_AND_EXECUTE with column metadata and the first page inline.
+
+    ``total`` is the advertised tuple count (default: the inline rows); a larger
+    value leaves the remaining rows to later FETCH pages.
+    """
+    total_rows = len(rs.rows) if total is None else total
     w = Wire()
     w.raw(CAS_INFO)
     w.i32(query_handle)
@@ -667,19 +736,19 @@ def prepare_and_execute_reply(rs: ResultSet, *, query_handle: int = 7) -> Seed:
     w.byte(rs.statement_type)
     w.i32(0)  # bind count
     w.byte(0)  # is_updatable
-    w.count(len(rs.columns))
+    w.column_count(len(rs.columns))
     write_column_metadata(w, rs.columns)
     w.mark()
-    w.i32(len(rs.rows))  # total tuple count
+    w.i32(total_rows)  # total tuple count
     w.byte(0)  # cache reusable
     w.count(1)  # result count
-    _result_info(w, rs.statement_type, len(rs.rows))
+    _result_info(w, rs.statement_type, total_rows)
     w.byte(0)  # includes_column_info
     w.i32(0)  # shard id
     w.mark()
     w.i32(0)  # fetch code
     w.count(len(rs.rows))
-    write_rows(w, rs.rows, rs.typed())
+    write_rows(w, rs.rows, rs.typed(), legacy_cell_type=rs.legacy_cell_type)
     return w.seed(f"prepare_and_execute/{rs.name}")
 
 
@@ -690,7 +759,7 @@ def prepare_info(w: Wire, rs: ResultSet, *, bind_count: int = 0) -> None:
     w.byte(rs.statement_type)
     w.count(bind_count)
     w.byte(0)  # is_updatable
-    w.count(len(rs.columns))
+    w.column_count(len(rs.columns))
     write_column_metadata(w, rs.columns)
 
 
@@ -721,7 +790,7 @@ def execute_reply(rs: ResultSet, *, refresh_columns: bool) -> Seed:
     w.mark()
     w.i32(0)  # fetch code
     w.count(len(rs.rows))
-    write_rows(w, rs.rows, rs.typed())
+    write_rows(w, rs.rows, rs.typed(), legacy_cell_type=rs.legacy_cell_type)
     suffix = "refreshed" if refresh_columns else "cached"
     return w.seed(f"execute_{suffix}/{rs.name}")
 

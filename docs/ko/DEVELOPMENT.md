@@ -13,6 +13,7 @@ pycubrid를 설정·테스트·기여하는 데 필요한 모든 것.
 - [프로젝트 구조](#프로젝트-구조)
 - [테스트 실행](#테스트-실행)
   - [오프라인 테스트](#오프라인-테스트)
+  - [동기/비동기 재생 패리티](#동기비동기-재생-패리티)
   - [통합 테스트](#통합-테스트)
   - [코드 커버리지](#코드-커버리지)
 - [Docker 설정](#docker-설정)
@@ -136,6 +137,105 @@ pytest tests/ -v --ignore=tests/test_integration.py \
 # 또는 Makefile 사용
 make test
 ```
+
+### 빠른 드라이버 테스트 vs. 저장소 도구 점검
+
+오프라인 테스트 중 `repo_tooling` 마커가 붙은 하위 집합(`pyproject.toml`에
+등록됨)은 저장소 정책과 도구를 점검합니다 — docs-sync 스크립트, PR 제목
+검증기, 릴리스 스크립트, 워크플로 YAML 계약, 공유 품질 게이트 등입니다(#558).
+이들은 pycubrid 드라이버 동작을 전혀 포함하지 않고 `pycubrid` 자체의
+커버리지에서도 제외되므로, `offline-tests` 매트릭스 대신 전용
+`repo-tooling-tests` CI job에서 실행되어 일상적인 드라이버 피드백 속도를
+유지합니다. 점검을 옮겨도 CI가 그것을 요구하는지 여부는 바뀌지 않습니다:
+`repo-tooling-tests`는 `offline-tests`와 마찬가지로 CI Gate에서 여전히 필수
+job입니다.
+
+```bash
+# 빠른 드라이버 레인 — 목킹된 드라이버 동작만 (offline-tests가 실행하는 것)
+pytest tests/ -m "not integration and not repo_tooling" -v
+
+# 저장소 도구 레인 — 정책/도구 점검 (repo-tooling-tests가 실행하는 것)
+pytest tests/ -m "repo_tooling" -v
+
+# 두 레인을 모두, 여전히 오프라인으로 (실제 CUBRID 서버 없이)
+pytest tests/ -m "not integration" -v
+```
+
+모듈은 파일 이동이나 경로 기반 수집 규칙이 아니라 명시적인
+`pytestmark = pytest.mark.repo_tooling`으로 도구 레인에 포함됩니다. 따라서
+디스크에서 재구성할 필요가 없고 `pytest tests/`에서 조용히 빠지는 테스트도
+없습니다(모든 마커는 기본 수집에 추가적일 뿐이며, 실행 시 선택하거나
+제외하는 것은 `-m`뿐입니다). `docs-sync.yml`은 의존성을 설치하지 않고
+`test_docs_reason.py`를 순수 `python -m unittest discover`로 실행하므로, 이
+모듈은(같은 위험이 있는 `test_pr_title.py`도) `pytest`를
+`try`/`except ModuleNotFoundError`로 가져오고, 없으면 빈 `pytestmark`로
+대체합니다 — 그곳에서는 마커 자체가 의미가 없기 때문입니다. pytest로만
+실행되는 모듈에는 이 보호 장치가 필요 없습니다.
+
+### 동기/비동기 재생 패리티
+
+`tests/test_replay_parity.py`는 동기 `Connection`과 비동기 `AsyncConnection`이
+같은 브로커에 대해 같게 동작하는지를 오프라인으로 몇 초 안에 검사합니다.
+`tests/helpers/replay_broker.py`는 스레드 기반의 프로세스 내 CAS 브로커입니다.
+TCP 세션을 여러 번 받을 수 있어 재접속이 실제로 일어나고, 각 요청에 시나리오별
+*스크립트*로 응답하며(지정하지 않은 요청에는 `tests/helpers/cas_reply.py`로 만든
+결정적인 기본 응답), 받은 모든 요청을 기록합니다.
+
+시나리오는 공개 연산(`open`, `close`, `connect`, `execute`, `fetchall`,
+`commit`, `ping` 등)의 목록과 스크립트로 이루어집니다. 두 드라이버에서 각각 새
+브로커로 재생한 뒤 네 가지를 비교합니다: 단계별 결과(반환값 또는 예외 타입),
+보낸 요청 전체(세션, CAS 함수, 되돌려 보낸 CAS_INFO, 인자), 이후 연결을 계속 쓸 수
+있는지(`ping(reconnect=False)`), TCP 세션 수. 시나리오는 드라이버가 *의도적으로*
+다른 항목을 이유와 함께 적고, 그 밖의 차이는 모두 실패입니다. 아직 고치지 않은
+알려진 차이는 `unintended=`로 기록해 strict `xfail`로 실행합니다. 각 시나리오의
+`check`는 두 관측 결과 모두에 실행되므로 시나리오가 원래 경로를 조용히 벗어날 수
+없습니다.
+
+```bash
+pytest tests/test_replay_parity.py -v
+```
+
+다루는 범위: 연결/종료, 종료 후 재접속, autocommit 설정/복원(명시적 설정, 생성자,
+미설정), commit/rollback에 의한 핸들 무효화, OUT_TRAN `CHECK_CAS` 검사, 한 번의
+`CHECK_CAS` 복구(autocommit 복원과 이스케이프 모드 재감지 포함)와 복구 실패, 교체된
+세션에 바인딩된 SQL(세대 펜스, #471/#485), 복구 여부별 `ping()` 실패, 잘못된
+응답과 잘린 응답(#533), 세션을 유지하는 `DataError`(#512), fetch 페이지
+`DataError` 계약(#536). 태스크 취소는 `pycubrid.aio`에만 있으므로 대신
+`tests/test_async_cancellation.py`에서 다룹니다.
+
+시나리오를 추가하려면 `SCENARIOS`에 단계, `_on(...)`으로 만든 스크립트(예: 응답 후
+CAS를 재활용하는 `_hang_up_after_ok`), `check`를 갖춘 `Scenario`를 추가합니다.
+
+**의도된 차이** (실패 아님):
+
+| 차이 | 이유 |
+|---|---|
+| `AsyncConnection(...)`은 연결하지 않고 `await pycubrid.aio.connect(...)`가 연결 | `__init__`은 await할 수 없음 |
+| 비동기 autocommit은 `await conn.set_autocommit(v)`로 설정 | 프로퍼티 setter는 await할 수 없음 |
+| 비동기 I/O 메서드는 모두 코루틴 | asyncio API |
+| 비동기 `create_lob()`은 `NotSupportedError`를 발생시키고 `LOB_NEW`를 보내지 않음 | 비동기 LOB 미지원(시나리오 `create_lob`) |
+| 태스크 취소 | 비동기 전용, 패리티에서 제외 |
+
+**하니스가 찾은 의도치 않은 차이** (모두 #521에서 수정):
+
+| 차이 | 수정 |
+|---|---|
+| 동기 `close()` 후 `connect()`가 명시적 `autocommit`을 다시 보내지 않음(#520) | `connect()`가 모든 대체 세션에서 명시적 세션 상태를 복원 |
+| 동기 `connect(autocommit=True)`가 재접속하는 프로퍼티 setter를 사용: `SET_DB_PARAMETER`와 `COMMIT` 사이에 `CHECK_CAS`가 추가되고, 그 사이 CAS가 재활용되면 두 요청이 다른 세션으로 나뉘며, 실패 시 원래 오류가 나오고 소켓이 열린 채 남음 | 비동기처럼 연 세션에서만 적용하고 실패 시 `OperationalError` |
+| 동기 `ping(reconnect=False)`가 `CHECK_CAS` 음수 응답 후에도 세션을 유지해 다음 요청이 조용히 재접속함 | 비동기처럼 손상된 세션을 닫음 |
+| `CHECK_CAS` 대체 세션에서 비동기 이스케이프 감지가 `auto_commit=0`을 보냄. 다른 모든 이스케이프 감지(두 드라이버)는 연결의 값을 보냄 | 대체 세션의 감지도 연결의 값을 보냄 |
+
+같은 시점에 공통 결함(패리티 차이 아님)도 수정했습니다: 자동 이스케이프 감지에서
+감지 `ROLLBACK` 직후 CAS가 재활용되면 autocommit 적용 전에 `connect()`가
+실패했습니다. 이제 두 드라이버 모두 그 OUT_TRAN 세션을 먼저 `CHECK_CAS`로
+확인하고 한 번 교체합니다.
+
+또 다른 공통 결함도 #551에서 수정했습니다(시나리오
+`autocommit_setter_survives_recycle_after_set_db_parameter`): 공개 autocommit
+setter는 두 요청 사이에 CAS가 재활용되면 `SET_DB_PARAMETER`와 `COMMIT`을 서로 다른
+CAS 세션으로 보냈습니다. 이제 `COMMIT` 전에 새 값을 기록하므로 그 요청의 한 번뿐인
+재접속이 대체 세션에 새 값을 먼저 복원합니다. `COMMIT`이 실패하면 연결을 닫고 이전
+값을 유지합니다.
 
 ### 통합 테스트
 
@@ -419,13 +519,36 @@ Ruff/Mypy가 없거나, 고정된 버전 대신 오래되거나 전역에 설치
 | 일반 | `integration and not slow and not tls` | PR/push CI, 전체 호환성 매트릭스, 나이틀리 bug hunt |
 | 장시간 | `integration and slow and not tls` | 나이틀리/수동 bug hunt의 soak, chaos, 동시성 stress |
 | TLS | `integration and tls` | 일반 CI와 전체 워크플로의 전용 TLS 잡 |
+| 공식 드라이버 차분 | `integration and official_differential` | 일반 CI와 전체 워크플로의 필수 `official-differential` 잡 (Python 3.10, CUBRID 10.2와 11.4) |
 
 `python scripts/check_integration_lanes.py`는 현재 마커 목록을 수집하고 각 레인의 실제
 워크플로 명령을 확인합니다. JUnit 검사(`--results FILE`)는 알려지지 않은 스킵,
-빈 실행 또는 전체 스킵을 실패 처리합니다. 선택적 CUBRIDdb 비교 드라이버 누락과
-`/proc`가 없는 플랫폼은 명시적으로 분류하지만, 브로커/TLS 설정 누락은 CI에서
-허용하는 스킵이 아닙니다. 나이틀리 bug hunt의 별도 오프라인 protocol, fault-broker,
+빈 실행 또는 전체 스킵을 실패 처리합니다. 공식 드라이버 차분이 자기 레인 밖에서
+스킵되는 경우는 `official-lane-only`로, `/proc`가 없는 플랫폼도 명시적으로
+분류합니다. 브로커/TLS 설정 누락은 CI에서 허용하는 스킵이 아니며,
+`--lane official`은 어떤 스킵도 허용하지 않습니다. 나이틀리 bug hunt의 별도 오프라인 protocol, fault-broker,
 placeholder 검사는 확장된 Hypothesis 프로필로 유지됩니다.
+
+공식 드라이버 차분(#446)은 고정 소스에서 빌드한 공식 `CUBRIDdb`/`_cubrid`
+드라이버와 pycubrid를 비교합니다. 로컬에서 재현하려면(Linux x86_64, git,
+CMake 3.21 이상, C 컴파일러, Python 3.10 헤더 필요) 다음을 실행합니다.
+
+```bash
+python3.10 scripts/build_official_oracle.py --out .official-oracle
+PYTHONPATH=.official-oracle PYCUBRID_OFFICIAL_ORACLE_REQUIRED=1 \
+  PYCUBRID_OFFICIAL_ORACLE_MANIFEST=.official-oracle/oracle.json \
+  PYCUBRID_DIFFERENTIAL_EVIDENCE=official-evidence.jsonl \
+  CUBRID_TEST_URL=cubrid://dba@localhost:33000/testdb \
+  python3.10 -m pytest tests/ -m "integration and official_differential"
+python scripts/check_official_differential.py --evidence official-evidence.jsonl
+```
+
+새로 추가하거나 바꾼 주장은 `tests/fixtures/official_differential_claims.json`에
+기록합니다. 해당 케이스는 `tests/test_official_differential.py`의 `CASES`에
+추가한 뒤 `python scripts/check_official_differential.py --write-docs`를
+실행합니다. 차이는 수정하거나, 이유·이슈·양쪽 관측값을 갖춘 `deviation`으로
+기록합니다. 현재 출력에 맞추려고 기대값만 고치지 마세요.
+[호환성 가이드](UPSTREAM_COMPATIBILITY.md#공식-드라이버-차분-게이트-446)를 참고하세요.
 
 `tests/test_protocol_fuzz.py`는 `tests/helpers/cas_reply.py`가 만든 실제와 같은
 브로커 응답을 변형합니다(#523). 모든 주요 타입의 컬럼 메타데이터와 행 데이터를

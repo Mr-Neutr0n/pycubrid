@@ -24,7 +24,15 @@ from pycubrid.aio.connection import AsyncConnection
 from pycubrid.constants import CUBRIDDataType, CUBRIDStatementType
 from pycubrid.exceptions import DataError, OperationalError
 from pycubrid.packet import PacketReader
-from pycubrid.protocol import ColumnMetaData, FetchPacket, LOBReadPacket, _read_value
+from pycubrid.protocol import (
+    ColumnMetaData,
+    FetchPacket,
+    LOBReadPacket,
+    PrepareAndExecutePacket,
+    PreparePacket,
+    _read_value,
+)
+from tests.helpers import cas_reply
 from tests.test_connection import socket_queue  # noqa: F401
 from tests.test_invalid_utf8_response import (
     CAS_INFO,
@@ -243,6 +251,62 @@ def test_fixed_width_cell_size_mismatch_in_call_result_is_malformed() -> None:
     )
     with pytest.raises(ValueError, match="cell size"):
         packet.parse(_fetch_body([[cell]]))
+
+
+def _call_fetch(body: bytes, column_count: int = 1) -> FetchPacket:
+    packet = FetchPacket(
+        1,
+        0,
+        columns=[ColumnMetaData(column_type=CUBRIDDataType.NULL)] * column_count,
+        statement_type=CUBRIDStatementType.CALL,
+    )
+    packet.parse(body)
+    return packet
+
+
+@pytest.mark.parametrize(
+    ("declared", "tail"),
+    [
+        # The size counts the one header byte it holds; the type byte is outside.
+        pytest.param(1, _INT_42, id="size-covers-only-first-header-byte"),
+        # The reply ends after the first header byte.
+        pytest.param(1, b"", id="reply-ends-inside-header"),
+    ],
+)
+def test_two_byte_cell_header_longer_than_its_cell_is_malformed(declared: int, tail: bytes) -> None:
+    # Protocol 8 CALL cells start with 0x80|charset, type (#542). A cell too
+    # short for that header must not borrow the next bytes as its type.
+    body = _fetch_body([[struct.pack(">iB", declared, 0x83) + tail]])
+    with pytest.raises((ValueError, IndexError)):
+        _call_fetch(body)
+
+
+def test_two_byte_cell_header_int_size_mismatch_is_malformed() -> None:
+    # Two header bytes + a 3-byte INT: the value width is checked after the header.
+    cell = struct.pack(">iBB", 2 + 3, 0x83, CUBRIDDataType.INT) + _INT_42[:3]
+    with pytest.raises(ValueError, match="cell size"):
+        _call_fetch(_fetch_body([[cell]]))
+
+
+def test_two_byte_cell_header_size_mismatch_after_unrepresentable_value_is_malformed() -> None:
+    # The re-walk before DataError (#512) reads the same two-byte header, so a
+    # later CALL cell whose INT does not fill its size is still framing damage.
+    zero_date = struct.pack(">BB3h", 0x83, CUBRIDDataType.DATE, 0, 0, 0)
+    short_int = struct.pack(">BB", 0x83, CUBRIDDataType.INT) + _INT_42[:3]
+    body = _fetch_body([[_cell(zero_date), _cell(short_int)]])
+    with pytest.raises(ValueError, match="cell size"):
+        _call_fetch(body, column_count=2)
+
+
+def test_two_byte_cell_header_unrepresentable_value_in_complete_reply_is_data_error() -> None:
+    # The re-walk also passes SQL NULL cells and a cell holding only its header.
+    zero_date = struct.pack(">BB3h", 0x83, CUBRIDDataType.DATE, 0, 0, 0)
+    int_42 = struct.pack(">BB", 0x83, CUBRIDDataType.INT) + _INT_42
+    header_only = struct.pack(">BB", 0x83, CUBRIDDataType.INT)
+    null = struct.pack(">i", -1)
+    body = _fetch_body([[_cell(zero_date), _cell(int_42), _cell(header_only), null]])
+    with pytest.raises(DataError):
+        _call_fetch(body, column_count=4)
 
 
 def test_fixed_width_cell_size_mismatch_after_an_unrepresentable_value_is_malformed() -> None:
@@ -541,3 +605,157 @@ async def test_async_unrepresentable_element_in_underfilled_collection_closes_co
         await conn._send_and_receive(packet)
     assert not isinstance(raised.value.__cause__, DataError)
     assert conn._connected is False
+
+
+# --- FC41 column metadata (#555) ---------------------------------------------
+#
+# PREPARE_AND_EXECUTE shares the column-metadata layout with FC2/FC3, but used
+# to decode a negative name/real-name/table-name/default length as an empty
+# string and a negative column count as "no columns". Both are framing damage.
+
+_FC41_RS = cas_reply.STRINGS
+_FC41_FIELDS = ("name", "real_name", "table_name", "default")
+
+
+def _negative_field(seed: cas_reply.Seed, field: str, value: int) -> bytes:
+    """``seed`` with one metadata word set to ``value`` and the reply kept coherent.
+
+    A rewritten text length also drops its payload, so a parser that reads a
+    negative length as "empty" stays aligned and decodes the whole reply.
+    """
+    reply = bytearray(seed.data)
+    if field == "column_count":
+        (pos,) = seed.column_counts
+        struct.pack_into(">i", reply, pos, value)
+        return bytes(reply)
+    # Second column, so the first column's metadata has already been read.
+    pos = seed.metadata_lengths[len(_FC41_FIELDS) + _FC41_FIELDS.index(field)]
+    old = struct.unpack_from(">i", reply, pos)[0]
+    reply[pos : pos + 4 + old] = struct.pack(">i", value)
+    return bytes(reply)
+
+
+def _fc41_reply(*, field: str | None = None, value: int = -1) -> bytes:
+    """A coherent FC41 SELECT reply, optionally with one negative metadata word."""
+    seed = cas_reply.prepare_and_execute_reply(_FC41_RS)
+    return seed.data if field is None else _negative_field(seed, field, value)
+
+
+def _fc41_packet() -> PrepareAndExecutePacket:
+    return PrepareAndExecutePacket("SELECT * FROM fuzz_t")
+
+
+FC41_NEGATIVE_FIELDS = [
+    pytest.param(field, value, id=f"{field}{value}")
+    for field in (*_FC41_FIELDS, "column_count")
+    for value in (-1, -(2**31))
+]
+
+
+@pytest.mark.parametrize(("field", "value"), FC41_NEGATIVE_FIELDS)
+def test_fc41_negative_metadata_field_is_malformed(field: str, value: int) -> None:
+    packet = _fc41_packet()
+    with pytest.raises(ValueError, match="negative|invalid prepared column") as raised:
+        packet.parse(_fc41_reply(field=field, value=value))
+    assert not isinstance(raised.value, DataError)
+
+
+@pytest.mark.parametrize(("field", "value"), FC41_NEGATIVE_FIELDS)
+def test_fc2_negative_metadata_field_is_malformed(field: str, value: int) -> None:
+    # The FC2 parity the FC41 path now follows.
+    reply = _negative_field(cas_reply.prepare_reply(_FC41_RS), field, value)
+    with pytest.raises(ValueError, match="negative|invalid prepared column"):
+        PreparePacket("SELECT * FROM fuzz_t").parse(reply)
+
+
+@pytest.mark.parametrize("field", _FC41_FIELDS)
+def test_fc41_zero_length_metadata_is_empty(field: str) -> None:
+    # Legal zero-length metadata (no bytes, not even the NUL) stays an empty string.
+    packet = _fc41_packet()
+    packet.parse(_fc41_reply(field=field, value=0))
+    assert getattr(packet.columns[1], field if field != "default" else "default_value") == ""
+    assert packet.column_count == len(_FC41_RS.columns)
+    assert len(packet.rows) == len(_FC41_RS.rows)
+
+
+def test_fc41_zero_column_count_without_metadata_is_valid() -> None:
+    reply = (
+        CAS_INFO
+        + struct.pack(">iiBiBi", 7, 0, CUBRIDStatementType.INSERT, 0, 0, 0)
+        + struct.pack(">iBi", 1, 0, 1)
+        + struct.pack(">Bi", CUBRIDStatementType.INSERT, 1)
+        + b"\x00" * 8
+        + struct.pack(">iiBi", 0, 0, 0, 0)
+    )
+    packet = PrepareAndExecutePacket("INSERT INTO t VALUES (1)")
+    packet.parse(reply)
+    assert packet.column_count == 0
+    assert packet.columns == []
+    assert packet.result_count == 1
+
+
+@pytest.mark.parametrize(("field", "value"), FC41_NEGATIVE_FIELDS)
+def test_sync_fc41_negative_metadata_field_closes_connection(
+    field: str,
+    value: int,
+    socket_queue: list[MagicMock],  # noqa: F811
+) -> None:
+    conn, sock = _connection_with_reply(socket_queue, _fc41_reply(field=field, value=value))
+    with pytest.raises(OperationalError, match="malformed response from broker") as raised:
+        conn._send_and_receive(_fc41_packet())
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert not isinstance(raised.value.__cause__, DataError)
+    assert conn._connected is False
+    sock.close.assert_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), FC41_NEGATIVE_FIELDS)
+async def test_async_fc41_negative_metadata_field_closes_connection(field: str, value: int) -> None:
+    conn = _async_connection_with_reply(_fc41_reply(field=field, value=value))
+    writer = conn._writer
+    assert isinstance(writer, MagicMock)
+    with pytest.raises(OperationalError, match="malformed response from broker") as raised:
+        await conn._send_and_receive(_fc41_packet())
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert not isinstance(raised.value.__cause__, DataError)
+    assert conn._connected is False
+    writer.close.assert_called()
+
+
+def _fc41_invalid_utf8_name() -> bytes:
+    """A complete FC41 reply whose second column name is not valid UTF-8."""
+    seed = cas_reply.prepare_and_execute_reply(_FC41_RS)
+    pos = seed.metadata_lengths[len(_FC41_FIELDS)]
+    reply = bytearray(seed.data)
+    reply[pos + 4] = 0xFF  # first byte of "c_varchar"
+    return bytes(reply)
+
+
+def test_sync_fc41_valid_and_unrepresentable_metadata_keep_connection(
+    socket_queue: list[MagicMock],  # noqa: F811
+) -> None:
+    conn, _ = _connection_with_reply(socket_queue, _fc41_reply())
+    packet = _fc41_packet()
+    conn._send_and_receive(packet)
+    assert [c.name for c in packet.columns] == [c.name for c in _FC41_RS.columns]
+    assert conn._connected is True
+
+    conn, _ = _connection_with_reply(socket_queue, _fc41_invalid_utf8_name())
+    with pytest.raises(DataError, match="column metadata is not valid"):
+        conn._send_and_receive(_fc41_packet())
+    assert conn._connected is True
+
+
+@pytest.mark.asyncio
+async def test_async_fc41_valid_and_unrepresentable_metadata_keep_connection() -> None:
+    conn = _async_connection_with_reply(_fc41_reply())
+    packet = _fc41_packet()
+    await conn._send_and_receive(packet)
+    assert [c.name for c in packet.columns] == [c.name for c in _FC41_RS.columns]
+    assert conn._connected is True
+
+    conn = _async_connection_with_reply(_fc41_invalid_utf8_name())
+    with pytest.raises(DataError, match="column metadata is not valid"):
+        await conn._send_and_receive(_fc41_packet())
+    assert conn._connected is True

@@ -612,7 +612,9 @@ CLASS/VCLASS/ATTRIBUTE/CONSTRAINT/PRIMARY_KEY/IMPORTED_KEYS/EXPORTED_KEYS를
 합니다. 고정 폭 값(`INT`, `DATE`, `OBJECT` 등)은 크기를 직접 읽지 않으므로 행
 파서가 값을 읽기 전에 타입의 폭과 비교합니다(#523). `DataError`를 발생시키기 전에
 응답을 다시 훑을 때도 같습니다. 0 이하의 크기는 SQL `NULL`입니다. 음수인 FETCH
-튜플 수도 잘못된 형식입니다. 연결은 이
+튜플 수도 잘못된 형식이며, FC2, FC3, FC41 컬럼 메타데이터의 음수 컬럼 수와 음수
+컬럼 이름, 실제 이름, 테이블 이름, 기본값 길이도 마찬가지입니다(#555). 길이 0은
+빈 문자열입니다. 연결은 이
 예외들을 `OperationalError("malformed response from broker")`로 바꾸고 연결을
 닫습니다. `DataError`는 응답은 완전하지만 Python이 값을 표현할 수 없는 경우에만
 사용합니다(#492, #512). 응답이 선언한 마지막 값 뒤에 남은 바이트는 검사하지
@@ -643,6 +645,14 @@ CLASS/VCLASS/ATTRIBUTE/CONSTRAINT/PRIMARY_KEY/IMPORTED_KEYS/EXPORTED_KEYS를
 `0x20`은 SET, `0x40`은 MULTISET, `0x60`은 SEQUENCE입니다. `0x80`이 설정되면
 두 번째 바이트 전체가 스칼라/요소 타입(31을 넘는 코드 포함)을 나타내며,
 그렇지 않으면 하위 5비트가 타입입니다. 컬렉션 행은 요소 타입이 아닌 컬렉션 종류로 디코딩합니다.
+
+`CALL` / `EVALUATE` 결과의 셀과 메타데이터 타입이 `NULL`인 컬럼(`SELECT NULL` 등)의
+셀은 값 앞에 자신의 타입 헤더를 가지며, 셀 크기는 이 헤더를 포함합니다. 프로토콜 7 이상
+브로커(CUBRID 10.2+)는 컬럼 메타데이터와 같이 `0x80 | 컬렉션 비트 | charset`, 그다음
+타입 바이트를 씁니다. 예를 들어 `INT` 42를 반환하는 함수의 `CALL`은
+`00000006 83 08 0000002a`, `CALL find_user('dba') ON CLASS db_user`는
+`0000000a 83 13 <8바이트 OID>`입니다. 이전 브로커는 타입 바이트 하나를 씁니다.
+드라이버는 두 형식을 모두 읽으며(#542), 셀보다 긴 헤더는 잘못된 응답입니다.
 
 컬렉션 값은 요소 타입 1바이트, 4바이트 요소 개수, 그리고 요소마다 4바이트 길이와 페이로드로
 구성됩니다. NULL 요소는 길이 `-1`이며 페이로드가 없습니다. 모든 요소가 NULL이면 CUBRID
