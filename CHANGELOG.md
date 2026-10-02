@@ -27,6 +27,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Explicit-mode recovery cases observe bound SQL and TCP sessions instead of
   incidental private flags. Hostile inputs, unknown-mode rejection, generation
   fences and malformed-reply safety tests remain; runtime behavior is unchanged.
+- **Native LOB handle fetch and bind (#441)** — `pycubrid.compat.native`
+  fetches and binds BLOB/CLOB handles with the official names:
+  `connection.lob()` (or `native.lob(conn)`), `cursor.fetch_lob(col, lob, /)`
+  and `cursor.bind_lob(index, lob, /)`, plus a local-only `lob.close()`, sync
+  only. `fetch_lob()` consumes the next row like `fetch_row()` and takes the
+  BLOB/CLOB type from the requested column (the official driver reads column
+  1); a non-int column raises `TypeError` first and, at the end of the
+  result, it returns `None` before the column range or type or the lob's
+  state is checked, as official; otherwise a non-LOB column raises
+  `ProgrammingError` without consuming the row, and a NULL cell leaves the
+  lob empty. `bind_lob()` sends the official bind bytes (when the official
+  lob type matches the column); a non-lob argument raises `TypeError` as
+  official. A fetched handle of a committed row may be bound again, on
+  another connection and after its own connection closed or reconnected, as
+  official; the server stores a copy. An empty or closed lob raises
+  `InterfaceError` before any request, and `fetch_lob()` fills only an open
+  lob of its own connection. Arguments are checked in the official order
+  (`TypeError` for a non-int index or column first). A complete reply whose
+  cell is not a handle of the column's LOB type raises `DataError` without
+  consuming the row and keeps the session; damaged handle framing raises
+  `OperationalError` and retires the uncertain physical session. Live 10.2/11.4 round trips cover BLOB and
+  UTF-8/CJK CLOB values from 0 bytes to 1 MB (above the broker's single-read
+  cap), NULL and mixed columns, repeated execution, cross-connection binds
+  and reconnect. Fourteen new official differential claims (eleven match, three
+  classified deviations) pass
+  on CUBRID 10.2 and 11.4. LOB write/read/seek and files remain #442/#443.
 - **Native collection binding (#440)** — `pycubrid.compat.native` binds
   SET, MULTISET and SEQUENCE parameter values with the official names:
   `connection.set()` (or `native.set(conn)`), `set.imports(data, type, /, *,
@@ -146,6 +172,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   execution and the public API are unchanged. Live 10.2/11.4 evidence: the
   broker rejects the MULTISET kind (error -454), and a SET value stored into a
   MULTISET column drops duplicates while a SEQUENCE value keeps them.
+- **Internal: LOB-handle binding wire contract (#441)** — not user-visible.
+  Prepared FC3 requests can carry an immutable BLOB/CLOB handle binding whose
+  bytes equal the official driver's `bind_lob()` request (checked against a
+  captured official request). The handle framing and its BLOB/CLOB type are
+  validated before any bytes are built. Each binding records the connection
+  and physical session it was made for, and the native prepared cursor sends
+  it only on that session (never on a replacement session or another
+  connection that happens to have the same generation number). There is no
+  public LOB binding API yet; ordinary sync/async execution is unchanged.
 
 ### Changed
 - **Faster FETCH row parsing (#559)** — a new offline microbenchmark,
@@ -212,6 +247,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `STRING == True` and `STRING != False` are now `False` and `True`. Integer
   subclasses such as `enum.IntEnum` still compare equal by value, so
   `STRING == CUBRIDDataType.STRING` is unchanged. (#369)
+- **`Lob.write()` keeps the handle's size field current (#441)** — the packed
+  handle returned by `Lob.lob_handle` embeds the LOB size, which the server
+  trusts when the handle is sent back. `write()` left it at the size the
+  handle had when it was created (usually 0), so a bound written handle would
+  store the wrong length. It now raises the field to `offset + bytes written`
+  after each write, never lowering it, as CCI does (also after a short
+  write; a reply that claims more bytes than were sent raises before the
+  handle changes). Later `write()`/`read()` requests carry the updated
+  handle, as CCI's do; return values and errors are unchanged. Live 10.2/11.4
+  evidence: written BLOB/CLOB handles up to 1 MB, bound through the internal
+  binding below, store their full length.
 - **`Lob.read()`/`Lob.write()` reject non-int and boolean offset/length
   (#449)** — `offset` (`read`/`write`) and `length` (`read`) must now be a
   concrete Python `int`: `type(value) is not int` is rejected, so `bool` (a
