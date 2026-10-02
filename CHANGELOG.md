@@ -7,6 +7,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Advisory nightly downstream corpus (#356)** — `bug-hunt.yml` now runs three
+  isolated CUBRID 11.4 dogfood lanes against the exact pycubrid workflow commit:
+  SQLAlchemy ORM and pool tests, MCP live tool tests, and Cookbook AI-agent and
+  async-worker tests. The selected test workloads use separate JUnit reports;
+  missing, failed or all-skipped workloads fail their advisory lane, while
+  legitimate empty-schema MCP skips are reported. Each lane verifies the
+  installed driver's Git origin/commit and import path after all dependencies
+  are installed, records the downstream commit and server version, and uploads
+  evidence even on failure. This does not change PR, release or full-matrix gates,
+  and does not claim MCP concurrency coverage.
+- **Deferred-close flush safety matrix (#585)** — real TCP replay checks four
+  generation/reconnect/native-error/transport-error properties for sync and
+  async commit and rollback. Removing the generation filter or flush guards
+  now fails these regressions; production behavior and dependencies are unchanged.
+- **Shared scalar-formatting coverage and observable escape recovery (#563)** —
+  Duplicate async scalar examples now use the existing pure-function golden
+  matrix under both escape modes, with small sync/async adapter wiring checks.
+  Explicit-mode recovery cases observe bound SQL and TCP sessions instead of
+  incidental private flags. Hostile inputs, unknown-mode rejection, generation
+  fences and malformed-reply safety tests remain; runtime behavior is unchanged.
+- **Native collection binding (#440)** — `pycubrid.compat.native` binds
+  SET, MULTISET and SEQUENCE parameter values with the official names:
+  `connection.set()` (or `native.set(conn)`), `set.imports(data, type, /, *,
+  kind=SET)` and `cursor.bind_set(index, s, /)`, sync only. As in the
+  official driver, every element is sent as a STRING element whatever the
+  element type code (any code except BIT/VARBIT, which raise
+  `NotSupportedError`), and the default `kind=SET` sends the official request
+  bytes, checked against a captured official request. `kind=MULTISET` keeps
+  duplicates and `kind=SEQUENCE` keeps duplicates and order; MULTISET is sent
+  as SEQUENCE because CUBRID 10.2/11.4 brokers reject the MULTISET bind kind
+  (-454). `data` must be a tuple (`InterfaceError` otherwise, as official);
+  `None` is a NULL element, and the text `'NULL'`, empty strings and Python
+  `int` elements (INT only, signed 64-bit) are accepted, while an element
+  with a NUL is rejected, as classified deviations. A set that was never
+  imported binds SQL NULL, as official. Invalid input fails before I/O and
+  leaves the set and the bound slot unchanged; a server conversion error
+  keeps the prepared handle usable. Fourteen new official differential
+  claims (seven match, seven classified deviations, including the error
+  classes) pass on CUBRID 10.2 and 11.4. The wrapper
+  `execute(..., set_type)`/`executemany` collection shapes are not provided
+  (#610).
 - **`charset` connection option (#86)** — `pycubrid.connect()`,
   `pycubrid.aio.connect()`, `pycubrid.compat.native.connect()` and
   `cubriddb.Connection(charset=...)` (previously `"utf8"` only) accept
@@ -97,6 +138,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   rejects a `set`/`frozenset` argument (`TypeError`), since its iteration
   order is not guaranteed and would make `Sequence`'s element order
   nondeterministic; `Set` and `Multiset` still accept a `set`/`frozenset`.
+- **Internal: typed collection binding wire contract (#482)** — not
+  user-visible. Prepared FC3 requests can carry an immutable
+  SET/SEQUENCE/MULTISET value of INT or STRING elements (NULL elements, empty
+  collections), with exact per-element framing and rejection of mixed,
+  nested and unsupported elements before any bytes are built. There is no public collection API yet (#440); ordinary sync/async
+  execution and the public API are unchanged. Live 10.2/11.4 evidence: the
+  broker rejects the MULTISET kind (error -454), and a SET value stored into a
+  MULTISET column drops duplicates while a SEQUENCE value keeps them.
+
+### Changed
+- **Faster FETCH row parsing (#559)** — a new offline microbenchmark,
+  `tests/test_bench_fetch_parsing.py` (2000-row scalar, text, mixed and
+  collection replies), guided two changes to the common row loop. The SET
+  conversion now runs only for SET columns, because every other type returned
+  the value unchanged. Each cell's size word is read inline instead of through
+  a method call. Median parse time drops by 13–23% for the scalar, text, mixed
+  and raw-collection workloads and by 5–6% for decoded collections (CPython
+  3.10, two runs); peak allocation is unchanged. Parsed values, errors and malformed-reply handling are unchanged. A
+  differential run of the old and new parser over 10,490 seed, truncated and
+  byte-mutated FETCH replies gave identical rows and identical exception types
+  and messages. Without `--benchmark-enable`, the benchmark runs only as a
+  correctness check.
+- **Internal: explicit per-reply session verification and one escape-mode policy (#525)** —
+  refactor with no behavior change in either driver. Whether an OUT_TRAN reply
+  still needed a `CHECK_CAS` probe was decided by comparing CAS_INFO object
+  identity with the last verified reply. Each reply is now recorded explicitly
+  and is marked verified only after `OPEN_DATABASE`, a successful `CHECK_CAS`
+  or a healthy `ping()`. Verification stays per reply, not per session: the CAS
+  may close the socket after any OUT_TRAN reply, so every one still gets its own
+  probe. A reconnect-only generation counter (the original proposal) would skip
+  needed probes, and no `CHECK_CAS` is removed. The 46 sync/async replay
+  scenarios, including the #557 round-trip budgets, send identical request
+  sequences before and after the change. The backslash-escape probe SQL, result
+  interpretation and error messages, previously copied in the sync connect,
+  async connect and async recovery paths, are now one shared helper.
+- **Autocommit cursor handles are released with the next statement (#488)** —
+  in autocommit mode only `commit()`/`rollback()` sent `CLOSE_REQ` for unclosed
+  cursors, the connection kept every cursor alive, and an explicit close cost a
+  `CLOSE_REQ` plus the `CHECK_CAS` probe of its OUT_TRAN predecessor. Live on
+  CUBRID 11.4.6 (statement pooling on), 5000 unclosed autocommit SELECTs pushed
+  handle ids past 1100 and forced 4-5 CAS memory restarts per run (each silently resets
+  SQL-set session state). Connections now track cursors weakly. When the broker
+  reports statement pooling, an autocommit `close()` or re-`execute()` and,
+  in any mode, a cursor collected without `close()` queue the handle id, and the
+  next `PREPARE_AND_EXECUTE` carries it as an extra prepare argument that CAS
+  frees before preparing (the wire mechanism of JDBC's deferred close; unlike
+  JDBC, which closes SELECT/CALL/EVALUATE handles at once, result-set handles
+  are deferred too). Measured live, sync and async:
+  5000 unclosed SELECTs keep the handle id at 1-2 with no restart; a SELECT then
+  `close()` takes 2 requests (1 `CHECK_CAS`) instead of 4 (2 `CHECK_CAS`); a reused
+  cursor's SELECT then INSERT takes 5 requests instead of 8. One statement
+  carries at most 256 ids (an explicit release while 256 are queued sends
+  `CLOSE_REQ` at once; collected cursors ride on later statements), and
+  `commit()`/`rollback()` close every id still queued with `CLOSE_REQ`, as they
+  closed unreferenced cursors before. The queue belongs
+  to one physical session and is dropped when that session is retired or
+  replaced, so no stale id is sent after a reconnect. Probes are unchanged, and a
+  request with queued ids is never replayed. Each handle keeps the generation of
+  the session that opened it, explicit releases during session setup are never
+  deferred, and a shard proxy
+  (which ignores the extra arguments) keeps immediate `CLOSE_REQ`. Without
+  statement pooling CAS frees
+  handles at every commit, so `CLOSE_REQ` is still sent at once and a collected
+  cursor's handle is left to that commit (in manual-commit mode it was
+  previously closed by the next `commit()`/`rollback()`).
 
 ### Documentation
 - **`llms.txt` no longer advertises prepared statements, and the two entry points are single-sourced (#414)** — the root `llms.txt` claimed prepared statements and a `Cursor.prepare()` method, which ordinary cursors do not have, listed an incomplete exception hierarchy, hardcoded test and coverage counts and linked to the retired `cubrid-cookbook/python` paths, while `docs/llms.txt` was a separately maintained, differing index. `docs/llms.txt` is now the only maintained index, checked against the code: driver-side literal binding and its documented limits, the opt-in sync-only `pycubrid.compat.native` prepared subset, sync and async (`pycubrid.aio`) feature parity, the full PEP 249 exception list and `cubrid-cookbook-python` links. `scripts/generate_llms_full.py` copies it byte-for-byte to the root `llms.txt`, and the CI `lint` job now fails when either `docs/llms-full.txt` or `llms.txt` is stale. `docs/SUPPORT_MATRIX.md` and `docs/TROUBLESHOOTING.md` (+ Korean) no longer describe `cursor.execute(sql, params)` as server-side `PREPARE_AND_EXECUTE` binding (the section is renamed "Parameterized Query Issues"), and the support matrix notes that `nextset()` raises `NotSupportedError`; the Korean, German, Hindi, Russian and Chinese READMEs now describe driver-side binding like the English README. `CONTRIBUTING.md` documents the workflow.
@@ -106,6 +212,106 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `STRING == True` and `STRING != False` are now `False` and `True`. Integer
   subclasses such as `enum.IntEnum` still compare equal by value, so
   `STRING == CUBRIDDataType.STRING` is unchanged. (#369)
+- **`Lob.read()`/`Lob.write()` reject non-int and boolean offset/length
+  (#449)** — `offset` (`read`/`write`) and `length` (`read`) must now be a
+  concrete Python `int`: `type(value) is not int` is rejected, so `bool` (a
+  subclass of `int`), `float`, `str` and any other `int` subclass (including
+  an `IntEnum` member) raise `InterfaceError("<name> must be an int, got
+  <type>")` before `_ensure_connected()` or any packet is built; the existing
+  non-negative check is unchanged. Previously only `value < 0` was checked,
+  so `lob.write(b"", offset=True)` silently returned `0` through the #394
+  empty-write shortcut, and a `float` offset passed that check and only
+  failed later, inside wire serialization, with `DataError`. Both now raise
+  `InterfaceError` before any I/O. Valid non-negative `int` offsets/lengths,
+  the empty-write shortcut's return value, and the `DataError` raised for an
+  in-range `int` too large to serialize (e.g. `offset=2**63`) are unchanged.
+  The regression suite's closed-LOB-precedes-invalid-arguments ordering test
+  is adapted from heyadhithya's PR #458.
+- **Missing-timezone test fixtures isolate cached wheel resources (#605)** —
+  Offline and integration helpers hide cached `tzdata.*` modules as well as
+  system timezone paths, then restore the original modules and exact caller
+  path. Preloaded-resource and cleanup regressions prevent order-dependent
+  successes in tests that require missing data; production timezone policy
+  and dependency declarations are unchanged.
+- **Collection conversion errors cannot hide malformed later elements (#595)** —
+  Known decoded collection members validate length words, payload bounds and
+  exact decoder consumption. The first complete `DataError` is saved while
+  subsequent members still run their decoders; later structural damage retires
+  the sync/async session. Complete collections keep the first error and cause.
+  NULL-only, opaque/disabled decoding and unsupported nested layouts are unchanged.
+- **Pooling-off autocommit replies retire freed handle ownership (#584)** —
+  Direct CUBRID CAS reuses handle IDs after an automatic transaction end.
+  Sync and async drivers now invalidate cursor/schema ownership on the actual
+  known-boundary OUT_TRAN reply, before parsing or a later INSERT identity RPC.
+  Current FC41 results cannot re-adopt already freed IDs on success or DataError.
+  Buffered rows and normal completed EOF remain available; unfinished results
+  fail explicitly rather than closing or fetching another cursor's reused ID.
+  Final ordinary autocommit FETCH and error replies follow the same rule.
+  Physical-session generation, pooling-on/manual/schema behavior and liveness
+  probes are preserved; arbitrary OUT_TRAN echoes and batch replies are excluded.
+- **Metadata text errors cannot hide damaged FC41/FC3 tails (#591)** —
+  Undecodable metadata retains column types for validation of remaining
+  counts, fields and inline rows before the original `DataError` is raised.
+  Later structural damage closes sync/async connections with `OperationalError`.
+  This error path excludes application JSON hooks and continues through later
+  cells after an unrepresentable row value, including collection and LOB
+  validation. Negative collection element counts and partial inline-fetch
+  headers are rejected; absent optional headers and undeclared trailing bytes
+  retain their contracts. Bounds re-walks use checked reader marks.
+- **Column metadata finishes its framing check before `DataError`; FC41 count gaps closed (#581)** —
+  column metadata text that is not valid in the connection codec raised
+  `DataError` at once in FC2, FC3 (refreshed columns) and FC41 replies, so
+  later metadata was never checked: a reply that also had a negative,
+  overrunning or truncated field in a later column kept the session. The
+  remaining metadata is now walked by its declared lengths first, and such a
+  reply raises `OperationalError('malformed response from broker')` and closes
+  the connection; a complete reply still raises `DataError` and keeps it. FC41
+  now rejects a negative bind count, `total_tuple_count` or inline tuple count
+  (previously ignored, passed through, or read as zero rows) and a column count
+  the reply cannot hold, as FC2 already did; FC3 rejects a negative inline
+  tuple count. Sync and async behave the same.
+- **Sync TLS handshake is bounded without `read_timeout`; the Python 3.10 TLS preflight probe closes its socket (#535)** —
+  `pycubrid.connect(..., ssl=...)` without `read_timeout` waited forever when the
+  broker (or a proxy in front of it) stalled during the TLS handshake. The
+  handshake now gives up after 10 seconds, the same default the async driver
+  passes as `ssl_handshake_timeout`, and raises `OperationalError`; the socket is
+  blocking again once the handshake is done, so later requests stay unbounded
+  as before. With `read_timeout` set nothing changes, and `connect_timeout`
+  still bounds only the TCP connect. On Python 3.10 the async driver's
+  certificate preflight probe now runs its handshake over memory BIOs on a
+  socket it owns, so a broker reset just before the ClientHello no longer
+  leaves the probe socket to the garbage collector (`ResourceWarning`).
+  Every probe I/O and handshake completion share one deadline, and failures
+  sending the final handshake flight propagate instead of being suppressed.
+  Best-effort close_notify cannot extend that deadline (#593). The
+  same CPython 3.10 `ssl` behavior can still affect the sync driver's
+  `wrap_socket()` upgrade on 3.10; `docs/CONNECTION.md` (+ Korean) documents it.
+- **Transport failures retire cursor handles; async timeout errors name their cause (#556)** —
+  an uncertain transport failure closed the connection but left cursors
+  holding the dead session's query handle ids: the sync socket-error and
+  malformed-reply paths and the async timeout, socket-error and malformed-reply
+  paths (also `ping()`, CHECK_CAS recovery and failed session restores) closed
+  the streams and marked the connection closed without invalidating handles,
+  and the async invalidation could be skipped entirely when `wait_closed()`
+  failed or was cancelled. Every such path now retires the connection and all
+  cursor and schema handles first, then shuts the stream down (async still
+  awaits `wait_closed()`; its failure is logged, and cancellation still raises
+  `CancelledError`). An interrupt (a non-`Exception` `BaseException` such as
+  `KeyboardInterrupt`) while a sync reply is outstanding now retires the
+  session too, as async cancellation already did. Buffered rows remain
+  readable and the next required FETCH fails explicitly; nothing is replayed.
+  The sync prepared-generation fence and pre-send local failures are
+  unchanged. The async `OperationalError('read timeout')` was raised for any
+  `TimeoutError`, including a transport `ETIMEDOUT` with `read_timeout` unset;
+  it now reads `read timeout: no complete round trip within read_timeout=<n>s` only when that
+  deadline expired, and `socket communication timed out` for a transport
+  timeout. Python 3.10's distinct `asyncio.TimeoutError` follows the same
+  transport/callback distinction. `__cause__` is preserved. An `OSError` (including `TimeoutError`)
+  raised by a `json_deserializer` callback after the whole reply was read was
+  treated as a transport failure by both drivers (session closed, wrapped in
+  `OperationalError`); it now propagates unchanged and the session stays open.
+  A `ValueError`-family error from a custom deserializer (orjson, simplejson)
+  is still treated as a malformed reply and retires the session.
 - **Negative FC41 column metadata lengths and column counts are rejected
   (#555)** — a `PREPARE_AND_EXECUTE` reply whose column name, real name, table
   name or default length was negative decoded that field as an empty string,
@@ -552,6 +758,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   talk to an in-process fake local server, not the configured live CUBRID
   endpoint, and either pass `no_backslash_escapes` explicitly or only
   exercise failure paths that never reach negotiation.
+- **Per-operation round-trip budgets for the sync/async replay harness
+  (#557)** — `tests/test_replay_parity.py` scenarios compared whole-session
+  request sequences, so both drivers growing the same extra request on a
+  single operation would stay green. `Observation.step_functions(i)` now
+  exposes the exact, ordered CAS functions sent while running one scenario
+  step alone, separate from connect/setup and every other step. Seven new
+  scenarios assert named budgets — `FIRST_INSERT_BUDGET`,
+  `REUSED_CURSOR_INSERT_BUDGET`, `SELECT_TO_INSERT_BUDGET`,
+  `MANUAL_INSERT_EXECUTE_BUDGET` / `MANUAL_INSERT_COMMIT_BUDGET`,
+  `FETCH_PAGINATION_BUDGET`, `ESCAPE_EXPLICIT_*` / `ESCAPE_AUTOMATIC_*` — for
+  a fresh cursor's first autocommitting INSERT, a second INSERT reusing the
+  same cursor, an autocommitting INSERT after a SELECT on the same cursor, a
+  manual-transaction INSERT and its explicit `commit()`, paginated `FETCH`
+  over a small `fetch_size`, and backslash-escape-mode negotiation resolved
+  explicitly versus automatically. Each budget is exact-list equality, so a
+  dropped safety request (e.g. a missing `CHECK_CAS` liveness probe) fails
+  the same as an added round trip; neither can pass as an "optimization".
+  Budget scenarios also require successful outcomes, a reusable session and
+  expected fetched rows, so malformed replies and wrong results cannot pass
+  solely by preserving the request count.
+  Existing scenarios, their checks and the sync/async parity and
+  reconnect/no-replay coverage are unchanged. No production behavior changes
+  in this PR; these scenarios are the reproducibility baseline that later
+  round-trip-reduction work (#419/#488/#525) must not silently regress.
 - **Repository policy/tooling checks run in a separate required CI job
   instead of the default offline-tests matrix (#558)** — the offline suite
   mixed mocked driver-behavior tests with subprocess-/importlib-heavy
@@ -581,6 +811,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   and `compat-check` — no CI requirement is weakened or dropped.
   `docs/DEVELOPMENT.md` (and its Korean translation) documents the fast-driver,
   repository-tooling and combined offline commands.
+
+### CI
+- **CI pip download caching and readiness path-filter fix (#564)** —
+  baseline measurements found 19 expanded jobs making separate editable dev
+  installs; `cache: pip` on the 10 `setup-python` YAML steps now permits
+  matching OS/Python jobs to reuse downloaded wheels without skipping the
+  installs. A warm same-head run had an observed cache hit and took 295s,
+  versus a 306s baseline and a 328s cold first attempt; runner and Docker
+  variance prevent attributing the entire difference to caching. Added
+  `scripts/wait_for_cubrid.py` to the `code:` filter so helper-only changes
+  select the required integration and official-differential lanes. A real
+  official comparison failure previously failed `CI Gate`, and new tests
+  preserve that fail-closed behavior and the docs-only skip exception. No
+  job, endpoint, release/nightly gate or required-check context changed.
+  Detailed data and limitations are in `docs/DEVELOPMENT.md`.
 
 ## [1.8.0] - 2026-09-29
 
@@ -755,7 +1000,12 @@ unchanged):
 - Full integration validation selects current pytest markers instead of filename globs. Normal, TLS, and nightly slow lanes cover the declared integration inventory, including concurrency stress; unknown skips and missing workflow paths fail the lane audit. TLS provisioning runs broker commands as the service owner. (#397)
 - Integration CI now uses the shared CUBRID readiness probe with host/port connection fields and fails before running tests when all retries are exhausted. (#411)
 - **`Connection.get_last_insert_id()` / `AsyncConnection.get_last_insert_id()` no longer return an ambiguous empty string after `commit()` (#381)** — cache the broker identity captured after INSERT so it survives commit/rollback and SELECT. Successful values remain strings; unavailable identities return `None`. A new INSERT attempt, nonempty batch, or physical connection change clears the cache; failed, empty, or malformed identity retrieval leaves it unavailable. The broker can report an earlier identity after a non-auto-increment INSERT, so an ID does not prove the current statement generated it or that a row exists after rollback. Migration: replace `value == ""` with `value is None` and check for `None` before `int(value)`; `cursor.lastrowid` remains `int | None`. This is a documented bug correction, not an annotation-only change.
-- **Empty `executemany()` clears previous results (#376)** — sync and async cursors close any previous query handle and reset result state to `description=None`, `rowcount=0`, and `lastrowid=None`. No SQL is executed; query-close failures propagate without discarding the handle.
+- **Empty `executemany()` clears previous results (#376)** — sync and async cursors
+  release the previous query handle and reset result state to `description=None`,
+  `rowcount=0`, and `lastrowid=None`. No SQL is executed; immediate query-close
+  failures propagate without discarding the handle. With deferred close (#488),
+  an eligible previous handle is queued without a request and an empty call
+  does not flush the queue; FC20 batches likewise do not carry queued IDs (#585).
 - Failed batch execution no longer exposes stale cursor result state (#375): sync and async executemany_batch clear prior result metadata, row counts, and last-insert IDs before the batch request, including per-statement, transport, and response-parse failure paths. If closing the previous query handle fails, no batch is sent and the handle remains tracked.
 - **`Cursor.arraysize` now rejects non-integer values in sync and async cursors (#370).** Floats, booleans, and other non-integers raise `ProgrammingError` without changing the previous value; positive integers remain valid.
 - **Batch execution closes an existing query handle (#374)** — `executemany_batch()` now releases an active server-side query handle before sending a batch request, matching `execute()` and preventing the prior result-set handle from leaking. Sync and async cursors keep the same behavior.

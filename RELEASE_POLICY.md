@@ -107,11 +107,13 @@ Adding optional parameters with defaults *at the end of the parameter list*,
 adding new methods, adding new exception subclasses, and adding new public
 modules are all permitted in minor releases.
 
-### Staged explicit compatibility namespaces (#438, #465, #439)
+### Staged explicit compatibility namespaces (#438, #465, #439, #440)
 
 The selected [additive design](docs/UPSTREAM_COMPATIBILITY.md#selected-additive-contract-438)
 includes construction-only `pycubrid.compat.cubriddb` (#465) and the bounded
-sync prepared INT32/string/NULL cursor in `pycubrid.compat.native` (#439).
+sync prepared INT32/string/NULL cursor in `pycubrid.compat.native` (#439),
+with its SET/MULTISET/SEQUENCE binding (`connection.set()`, `native.set`,
+`set.imports()`, `cursor.bind_set()`, #440).
 Only their implemented factories, connection and cursor methods are public;
 no wrapper cursor, public async prepared API, threadsafety declaration or
 complete native/DB-API parity is promised. The checker and baseline cover
@@ -246,6 +248,124 @@ Code without a corresponding documentation update is considered incomplete.
 
 Backward-compatible bug fixes ship in a **PATCH** release (§2). Recorded here so
 the documented release contract stays complete alongside `CHANGELOG.md`:
+
+- **`Lob.read()`/`Lob.write()` reject non-int and boolean offset/length
+  (#449)** — MINOR / behavior change, not a PATCH. `offset` (`read`/`write`)
+  and `length` (`read`) must now be a concrete Python `int`
+  (`type(value) is not int` is rejected); the pre-existing non-negative check
+  is unchanged. This is classified MINOR rather than PATCH because it changes
+  observable results for inputs that previously completed without error:
+  before this change, `lob.write(b"", offset=True)` silently returned `0`
+  (`bool`, a subclass of `int`, satisfied the old `offset < 0` check and then
+  the #394 empty-write shortcut), and a `float` offset passed that same check
+  and only failed later, inside wire serialization, with `DataError`. Both
+  now raise `InterfaceError` before `_ensure_connected()` or any packet is
+  built, i.e. before any I/O — a stricter, earlier and differently-typed
+  failure than before for those two cases. Accepting `bool` as an offset was
+  a bug (the cursor `arraysize` contract already requires `type(value) is
+  int`), and the old behavior for both cases was itself pinned by the #394
+  test suite, which this change updates. Valid non-negative `int` arguments,
+  the empty-write shortcut's return value, and the existing `DataError` for
+  an in-range `int` too large to serialize (e.g. `offset=2**63`) are
+  unchanged. No public signature, dependency or supported-version change.
+
+- **Native collection binding (#440)** — MINOR / additive. New
+  `pycubrid.compat.native.set` class (and `__all__` entry),
+  `connection.set()`, `set.imports(data, type, /, *, kind=SET)` and
+  `cursor.bind_set(index, s, /)`. The default `kind=SET` sends the official
+  driver's request bytes (STRING elements whatever the element type); the
+  `kind` keyword and the classified deviations (`None` NULL element, literal
+  `'NULL'`, empty string and Python `int` elements, NUL rejection, error
+  classes) are pinned by official differential claims. Ordinary sync/async
+  cursors, FC41 rendering, fetched collection decoding, `bind_param()`,
+  dependencies and supported versions are unchanged; no async prepared API.
+
+- **Faster FETCH row parsing (#559)** — PATCH / internal performance change
+  with no behavior change. Row values, `DataError` / malformed-reply
+  classification, connection lifetime, request bytes, public signatures,
+  dependencies and supported versions are unchanged. The new offline
+  benchmark times nothing in required CI.
+
+- **Collection element validation continues after conversion errors (#595)** —
+  PATCH / malformed-response correction. A complete first element `DataError`
+  cannot hide a malformed later typed element. Complete collections retain
+  the first error and its cause; ordinary values, NULL-only diagnostics and
+  opaque/unsupported decoding contracts are unchanged. No new public surface.
+
+- **FC41/refreshed FC3 metadata errors wait for tail validation (#591)** —
+  PATCH / malformed-response correction. Framing faults after undecodable
+  metadata retire the connection rather than reporting a recoverable
+  `DataError`. Error-path validation excludes application hooks and continues
+  past unrepresentable cells. Complete replies retain the first metadata error;
+  normal decoding/hooks, absent optional inline headers and unused trailing
+  bytes are unchanged. Reader marks are internal, not public DB-API additions.
+
+- **Pooling-off autocommit result ownership (#584)** — PATCH / cursor safety
+  correction. Known transaction-ending OUT_TRAN replies retire ordinary
+  cursor/schema IDs already freed by direct CUBRID CAS before they can be reused.
+  The current FC41 result cannot adopt a freed ID, including after DataError.
+  Buffered rows/counts, completed EOF, physical generation and liveness checks
+  remain unchanged; an unfinished invalidated result uses the existing
+  InterfaceError contract. Pooling-on/manual/schema/proxy behavior and batch
+  replies are excluded. No public signature, dependency or support-matrix change.
+
+- **Column metadata framing checked before `DataError`; FC41 counts (#581)** —
+  PATCH / correction of a protocol-robustness defect completing #555, #523 and
+  #383. A reply whose column metadata has undecodable text and framing damage
+  in a later column, or an FC41 reply with a negative bind, total or inline
+  tuple count or an impossible column count (or an FC3 reply with a negative
+  inline tuple count), now raises `OperationalError('malformed response from
+  broker')` and closes the connection instead of `DataError` with the session
+  kept, or being accepted. Valid replies, the `DataError` classification of
+  complete replies (#492, #512), public signatures, dependencies and supported
+  versions are unchanged; sync and async behave the same.
+
+- **Sync TLS handshake bound without `read_timeout`; 3.10 probe socket closed
+  (#535)** — PATCH / correction of a hang and a resource leak. Without
+  `read_timeout`, the sync TLS handshake now fails with `OperationalError` after
+  10 seconds instead of waiting forever, matching the async
+  `ssl_handshake_timeout` default; requests after the handshake are still
+  unbounded. The Python 3.10 async preflight probe closes its socket on a peer
+  reset instead of leaving it to the garbage collector. Its BIO sends, reads
+  and completion use one total deadline (#593); final-flight transport failures
+  propagate, while optional shutdown remains inside the budget. `read_timeout` and
+  `connect_timeout` semantics, successful TLS connects, public signatures,
+  dependencies and supported versions are unchanged.
+
+- **Deferred CLOSE_REQ for released cursor handles (#488)** — PATCH /
+  performance and resource-leak correction in both drivers, with no public API,
+  dependency or supported-version change. On a broker with statement pooling,
+  an autocommit `close()`/re-`execute()` and a cursor collected without
+  `close()` no longer send their own `CLOSE_REQ`. The handle is freed by the
+  next `PREPARE_AND_EXECUTE`, which is wire-visible (extra prepare arguments,
+  fewer requests) but does not change transaction or session state: CAS frees
+  the handle exactly as `CLOSE_REQ` does. Until that next statement the handle
+  stays allocated a little longer, until the next statement, `commit()` or
+  `rollback()` (which close queued ids with `CLOSE_REQ`), or the session end.
+  Connections no longer keep
+  unreferenced cursors alive. In manual-commit mode with pooling off, a cursor
+  dropped without `close()` is no longer closed by an explicit `CLOSE_REQ` at
+  the next `commit()`/`rollback()`: CAS frees it in that `END_TRAN`.
+
+- **Transport failures retire cursor handles; async timeout messages (#556)** —
+  PATCH / bug correction in both drivers. After an uncertain transport failure
+  the connection was already closed and raised `OperationalError`; now every
+  cursor and schema handle of that session is retired with it, so later cursor
+  calls fail with the existing invalidated-result errors instead of reaching a
+  closed connection with a stale handle id. A sync interrupt while a reply is
+  outstanding now closes the session (previously it stayed open with an unread
+  reply). The async `OperationalError` message for a `read_timeout` expiry
+  changes from `read timeout` to `read timeout: no complete round trip within
+  read_timeout=<n>s` (still starting with `read timeout`), and a transport
+  `TimeoutError` now reads `socket communication timed out`. An `OSError`
+  raised by a `json_deserializer` callback after a complete reply now
+  propagates unwrapped with the session kept, instead of `OperationalError`
+  with the session closed; a `ValueError`-family callback error is still a
+  malformed reply that retires the session. Python 3.10's distinct
+  `asyncio.TimeoutError` follows the same transport/callback distinction.
+  Other exception classes,
+  `__cause__`, `CancelledError` propagation and the no-replay rule are
+  unchanged; no public signature, dependency or supported-version change.
 
 - **Async setup failure isolated per waiting task (#554)** — PATCH / bug
   correction of cancellation and error propagation. Tasks waiting on

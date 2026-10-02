@@ -70,7 +70,30 @@ overrunning length, a row cell whose value does not use exactly its declared
 size (#523), or collection elements that do not fill their size, raise
 `ValueError`, which the connection reports as `OperationalError('malformed
 response from broker')` and closes. Trailing bytes after the last declared
-value are not checked; `DataError` is only for a complete reply (#492, #512).
+value are not checked; `DataError` is only for a complete reply (#492, #512):
+undecodable column metadata text re-walks the remaining metadata by length
+(#581), and FC41/refreshed FC3 defer that error until their declared tail and
+inline rows have been validated without application hooks (#591). Later
+structural errors close the session; complete replies retain the first
+metadata DataError.
+
+Known decoded collection elements validate their declared sizes and consumed
+bytes even after a complete element raises DataError (#595). Later structural
+damage wins; complete collections retain the first conversion error. Opaque
+and unsupported nested member layouts keep their existing raw-byte contracts.
+
+Typed collection FC3 binds (#482; public only through `compat.native`
+`set.imports()`/`bind_set()`, #440) send
+the kind byte (SET `16`, MULTISET `17`, SEQUENCE `18`) as the type argument
+and `[element type][int32 len, payload]*` as the value, with no element count.
+INT elements are 4 bytes, STRING (`2`) elements are connection-charset bytes
+plus NUL, and a NULL element has length 0. The broker silently keeps a partial
+collection when an element length overruns the value, so validate every
+element (flat tuple, no mixed/nested/bool/float/bytes) before building bytes.
+Whole SQL NULL stays the scalar NULL pair. 10.2/11.4 brokers reject the
+MULTISET kind with -454. The public #440 `imports()` matches the official
+bytes: STRING elements whatever the requested type, default kind SET, and
+`kind=MULTISET` sent as SEQUENCE.
 
 `CAS_INFO[0]` is transaction status: `0` is OUT_TRAN and `1` is IN_TRAN.
 OUT_TRAN after END_TRAN is not a signal to reconnect; retain the physical
@@ -78,9 +101,21 @@ session. Because the CAS may still close the socket after an OUT_TRAN reply
 (memory restart, broker reset, CHANGE CLIENT), probe with CHECK_CAS before the
 next request (JDBC `checkReconnect` parity) and replace the session only when
 that probe fails: once per request, before the request is first sent, restoring
-driver-owned state (#485). Explicit `ping(reconnect=True)` also recovers a
+driver-owned state (#485). Verification is explicit and per reply: every reply
+is recorded unverified, and only OPEN_DATABASE, a successful CHECK_CAS or a healthy
+ping marks it verified (#525); never key it on object identity, bytes or a
+reconnect-only generation. Explicit `ping(reconnect=True)` also recovers a
 confirmed CAS/transport failure; arbitrary SQL is never replayed automatically.
 Commit/rollback CLOSE_REQ open cursor handles before END_TRAN.
+With broker statement pooling on, autocommit releases (and cursors collected
+without close) queue their handle ids for the next FC41's extra prepare
+arguments (JDBC's wire mechanism, but result-set handles too, #488): at most 256
+per statement, per physical generation, CLOSE_REQ'd at commit/rollback, dropped
+on session retirement. With pooling off, known transaction-ending OUT_TRAN
+replies retire existing handle ownership before parsing or identity lookup
+(#584); FC41 success/DataError adoption cannot restore the already-freed ID.
+Cached rows/counts remain usable, and only still-owned handles use immediate
+CLOSE_REQ. Other OUT_TRAN echoes and schema/manual FETCH are not boundaries.
 With `no_backslash_escapes` unset, probe each newly opened physical session
 before binding against it; explicit `True`/`False` remains pinned. Healthy
 same-session ping does not probe. A failed probe makes direct connect raise or
@@ -94,6 +129,12 @@ heterogeneous failover.
 
 1. **ClientInfoExchange**: Send 10 bytes (NO header) — magic `"CUBRS"` when `ssl` is requested (STARTTLS) or `"CUBRK"` plaintext, plus client type + version. Broker replies a 4-byte int32: `0`=ok, `<0`=fail-fast (`OperationalError`), `>0`=redirect port (reconnect on the new port WITHOUT repeating the handshake).
 2. **TLS upgrade (optional)**: If `ssl` was truthy, upgrade the live transport via `loop.start_tls()` (async) or `ssl.SSLContext.wrap_socket()` (sync) before `OPEN_DATABASE`.
+   The handshake uses `read_timeout` or a 10-second default; the default does not
+   limit later requests. On Python 3.10, the async certificate preflight uses
+   memory BIOs on an owned socket: each send/receive and completion share one
+   monotonic deadline, required final-flight failures propagate, and optional
+   close-notify cannot extend the deadline. The owned socket always closes.
+   The primary sync Python 3.10 reset limitation is documented in CONNECTION.md.
 3. **OpenDatabase**: Send db/user/password (628 bytes payload, no header — `PacketWriter(reserve_header=False)`)
 4. **PrepareAndExecute / Prepare+Execute → Fetch → CloseQuery → EndTran → CloseDatabase**
 
